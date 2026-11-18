@@ -211,7 +211,11 @@ def build_server(
 
 async def serve(settings: Settings) -> None:
     """Run until interrupted, keeping SDK dependencies outside the simulator process."""
-    manager = JobManager(settings, SimulatorBackend(settings))
+    backend_type = SimulatorBackend
+    if os.environ.get("A100SIM_SCENE_URL"):
+        from a100sim.rpc.scenes import SceneBackend
+        backend_type = SceneBackend
+    manager = JobManager(settings, backend_type(settings))
     certificate = (
         Path(os.environ["A100SIM_GRPC_TLS_CERT"]).read_bytes() if os.environ.get("A100SIM_GRPC_TLS_CERT") else b""
     )

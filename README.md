@@ -727,6 +727,33 @@ USD 使用标准 `UsdPreviewSurface` 及顶点 primvar reader 传递上述通道
 
 `Job.artifacts` 提供 `artifact_id/name/size_bytes/media_type`，`result` 中产物引用采用 `artifact://<id>`。下载必须提供对应 `job_id + artifact_id`；不能用它读取其他任务或任意文件。`offset` 默认 0，可续传；`chunk_bytes` 默认 256 KiB、最大 1 MiB。每个返回块有绝对文件 offset。调用方检查连续 offset 和最终长度；产物保留期也受内部工作进程策略约束，过期会返回错误。
 
+### 保留场景与多相机采集
+
+BenchForge 的场景采集通过独立 Kit worker 保存 USD 场景；物理推进、状态观测和所有相机读取同一场景状态：
+
+```bash
+cd a100
+bash start-scenes.sh
+# 在另一个终端或服务管理器中为网关设置此变量，再启动网关。
+A100SIM_SCENE_URL=http://127.0.0.1:18324 bash serve-grpc.sh
+```
+
+`A100SIM_SCENE_GPU` 可选择已分配的设备，默认沿用 `ISAAC_GPU`，同样遵守继承的设备范围和 UUID 校验。
+`A100SIM_SCENE_PORT` 默认 `18324`。worker 与网关必须共享资产与结果目录，内部 HTTP 只监听 loopback。
+启动前沿用上述运行时安装步骤；这两个进程由部署者的服务管理器分别维护。
+
+网关注册 `asset.import`、`scene.edit`、`physics.step`、`world.observe`、`scene.inspect`、`scene.capture`、
+`scene.export`、`scene.close` 八个 `SubmitTask.extension` 操作；通过 `GetCapabilities` 查询 `extension.*` 就绪状态。
+导入的 `source` 仅接受 `UploadAsset` 返回的 `asset_id` 和 `relative_path`，其余操作使用返回的 `session_id`。
+原生物件可指定 `fix_base`、`mass_kg`、`physics` 接触参数和 `source_up_axis`，保留原始单位、碰撞与材质。
+编辑仅支持变换及语义标签；推进使用 CUDA PhysX，并保存真实位姿、线速度和弧度制角速度。
+采集支持 1–32 个已定义相机、64–1024 方形像素、1–256 spp 及可选主表面标注；结果使用既有产物下载接口。
+
+USD 场景、观测与已接受任务保存在磁盘；重启后的中断任务不会自动重提。关闭场景不删除产物。
+渲染支持 `UsdPreviewSurface` 及已显式映射的 `OmniPBR`、`MI_Props`、`MI_TrashCan`、`MI_Clock`、
+`MI_DoorEntrance_glass` 输入，保留 UV 接缝、逐面角法线、PBR 贴图与灯具发光；其他 MDL 程序明确报错。
+该渲染与主表面标注沿用 A100 CUDA 适配范围，不模拟原生 RTX、光学传感器噪声或透射语义标签。
+
 ### 任务状态、幂等与错误
 
 `Job` 包含 `job_id/request_id/operation/state/revision/result/failure/artifacts/timings/created_at_unix`。任务状态为：

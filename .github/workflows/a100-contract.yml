@@ -1,0 +1,41 @@
+name: A100 contract
+
+on:
+  push:
+    branches: [A100]
+    paths: ["a100/**", ".github/workflows/a100-contract.yml"]
+  pull_request:
+    branches: [A100]
+    paths: ["a100/**", ".github/workflows/a100-contract.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a100-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: a100/requirements-grpc.txt
+      - name: Install isolated gateway and formatting dependencies
+        run: python -m pip install -r a100/requirements-grpc.txt black==25.1.0 isort==6.0.1
+      - name: Check new scene modules
+        run: |
+          python -m black --check --line-length 120 a100/a100sim/rpc/scenes.py a100/a100sim/scenes a100/tests/test_scene_rpc.py
+          python -m isort --check-only --profile black --line-length 120 a100/a100sim/rpc/scenes.py a100/a100sim/scenes a100/tests/test_scene_rpc.py
+          python -m compileall -q a100/a100sim/scenes a100/a100sim/rpc/scenes.py
+          bash -n a100/start-scenes.sh
+      - name: Run CPU transport and service contracts
+        env:
+          PYTHONPATH: a100:a100/tests
+        run: python -m unittest -v test_contract test_features test_grpc test_portability test_scene_rpc

@@ -31,55 +31,8 @@ def surface_material(prim, vertex_color=False, channels=()):
 
 
 def mesh_shape(prim, matrix):
-    mesh = UsdGeom.Mesh(prim)
-    if mesh.GetSubdivisionSchemeAttr().Get() not in (None, "none"):
-        raise ValueError(f"Subdivision surfaces require tessellation: {prim.GetPath()}")
-    points = np.asarray(mesh.GetPointsAttr().Get(), np.float32)
-    counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get(), np.int32)
-    indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get(), np.uint32)
-    if not len(points) or np.any(counts != 3):
-        raise ValueError(f"USD mesh must be triangulated: {prim.GetPath()}")
-    normals = mesh.GetNormalsAttr().Get()
-    normals = np.asarray(normals, np.float32) if normals else None
-    if normals is not None and (mesh.GetNormalsInterpolation() != "vertex" or len(normals) != len(points)):
-        raise ValueError(f"USD normals must have vertex interpolation: {prim.GetPath()}")
-    colors = mesh.GetDisplayColorPrimvar()
-    rgb = np.asarray(colors.ComputeFlattened(), np.float32) if colors and colors.Get() else None
-    if rgb is not None and len(rgb) != len(points):
-        if len(rgb) == 1:
-            rgb = np.repeat(rgb, len(points), axis=0)
-        else:
-            raise ValueError(f"USD displayColor must have vertex interpolation: {prim.GetPath()}")
-    values = {}
-    for name in MATERIAL_CHANNELS:
-        attribute = UsdGeom.PrimvarsAPI(prim).GetPrimvar("a100sim:" + name)
-        if attribute and attribute.HasValue():
-            if attribute.GetInterpolation() != "vertex":
-                raise ValueError(f"USD {name} primvar must use vertex interpolation: {prim.GetPath()}")
-            values[name] = attribute.ComputeFlattened()
-    channels = read_mesh_channels(values, len(points))
-    props = mi.Properties()
-    props["bsdf"] = surface_material(prim, vertex_color=rgb is not None, channels=tuple(channels))
-    shape = mi.Mesh(
-        str(prim.GetPath()),
-        vertex_count=len(points),
-        face_count=len(counts),
-        props=props,
-        has_vertex_normals=normals is not None,
-    )
-    if rgb is not None:
-        shape.add_attribute("vertex_color", 3, rgb.reshape(-1))
-    for name, values in channels.items():
-        shape.add_attribute("vertex_" + name, 1, values)
-    params = mi.traverse(shape)
-    params["vertex_positions"] = (points @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32).reshape(-1)
-    params["faces"] = indices.reshape(-1)
-    if normals is not None:
-        normals = normals @ np.linalg.inv(matrix[:3, :3])
-        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-10)
-        params["vertex_normals"] = normals.astype(np.float32).reshape(-1)
-    params.update()
-    return shape
+    from .scenes.meshes import mesh_shape as native_mesh
+    return native_mesh(prim, matrix)
 
 
 def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0, annotations=False):
