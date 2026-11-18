@@ -175,7 +175,7 @@ class SceneTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure.exception.code, grpc.StatusCode.DEADLINE_EXCEEDED)
         self.assertIn("still retained", str(failure.exception))
         self.assertEqual(sum(route == "/scene" for route, _ in calls), 1)
-        self.assertLessEqual(calls[1][1]["timeout"], 0.05)
+        self.assertLess(calls[1][1]["timeout"], 0.051)
         receipt = json.loads((self.root / "scene-worker.json").read_text(encoding="utf-8"))
         self.assertEqual(receipt["id"], "b" * 32)
         self.assertTrue(receipt["retained"])

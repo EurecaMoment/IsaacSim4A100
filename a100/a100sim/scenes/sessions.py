@@ -11,11 +11,10 @@ from typing import Any
 
 import numpy as np
 import omni.usd
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
-
 from a100sim.app import Physics
 from a100sim.scenes.physics_state import snapshot_physics, validate_retained_poses
 from a100sim.service_queue import finite, integer, persist
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
 
 SESSION_ID = re.compile(r"[a-f0-9]{32}\Z")
 

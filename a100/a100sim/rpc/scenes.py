@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import grpc
-
 from a100sim.network import require_worker_url
 from a100sim.rpc.backend import RegisteredOperation, SimulatorBackend
 from a100sim.rpc.config import Settings
