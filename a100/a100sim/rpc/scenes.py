@@ -13,24 +13,21 @@ from pathlib import Path
 from typing import Any
 
 import grpc
+
 from a100sim.network import require_worker_url
 from a100sim.rpc.backend import RegisteredOperation, SimulatorBackend
 from a100sim.rpc.config import Settings
 from a100sim.rpc.errors import ServiceError
 from a100sim.rpc.storage import AssetStore
 from a100sim.rpc.v1 import simulator_pb2 as pb
+from a100sim.scenes.contracts import OPERATIONS, PARAMETER_SCHEMAS
 from a100sim.service_queue import persist
 
-OPERATIONS = {
-    "asset.import": "Import an uploaded USD into a retained independent scene session",
-    "scene.edit": "Apply bounded transforms and supported scalar attributes before simulation",
-    "physics.step": "Advance and retain one scene using CUDA PhysX",
-    "world.observe": "Read measured CUDA body velocities from the last physics step",
-    "scene.inspect": "Read paged USD hierarchy, world transforms and collider attributes",
-    "scene.capture": "Render up to 32 authored cameras from the same retained physical state",
-    "scene.export": "Export the retained flattened USD and optional dependency package",
-    "scene.close": "Close the session while preserving its immutable artifacts",
-}
+OBSERVATION_TIMEOUT_SECONDS = 1800
+POLL_TIMEOUT_SECONDS = 5
+TRANSIENT_OBSERVATION_CODES = frozenset(
+    {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.RESOURCE_EXHAUSTED}
+)
 
 
 class SceneBackend(SimulatorBackend):
@@ -45,7 +42,7 @@ class SceneBackend(SimulatorBackend):
             async def handler(arguments: dict[str, Any], directory: Path, operation: str = name) -> dict[str, Any]:
                 return await self.scene_task(operation, arguments, directory)
 
-            self.register(name, RegisteredOperation(handler, scope, {"type": "object"}))
+            self.register(name, RegisteredOperation(handler, scope, PARAMETER_SCHEMAS[name]))
 
     async def describe(self) -> list[pb.Capability]:
         """Advertise scene operations only when their independent worker is ready."""
@@ -72,16 +69,48 @@ class SceneBackend(SimulatorBackend):
         accepted = await self._request("scenes", "/scene", {**payload, "operation": operation})
         job_id = accepted["id"]
         # Once accepted, retain the upstream identity and never submit it again.
-        persist(directory / "scene-worker.json", {"id": job_id, "operation": operation})
-        deadline = time.monotonic() + 1800
+        receipt = {"id": job_id, "operation": operation}
+        persist(directory / "scene-worker.json", receipt)
+        try:
+            async with asyncio.timeout(OBSERVATION_TIMEOUT_SECONDS):
+                return await self._observe_scene(job_id)
+        except TimeoutError as error:
+            persist(directory / "scene-worker.json", {**receipt, "observation": "deadline_exceeded", "retained": True})
+            raise ServiceError(
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+                "Scene observation exceeded its deadline; accepted work is still retained on the simulator. "
+                "Inspect the worker receipt; do not resubmit the task.",
+            ) from error
+        except asyncio.CancelledError:
+            # Gateway shutdown cancels observation, not GPU execution. Preserve
+            # the accepted identity and let cancellation reach the job manager.
+            persist(directory / "scene-worker.json", {**receipt, "observation": "cancelled", "retained": True})
+            raise
+
+    async def _observe_scene(self, job_id: str) -> dict[str, Any]:
+        """Retry transient status reads only, within the caller's observation budget."""
+        deadline = time.monotonic() + OBSERVATION_TIMEOUT_SECONDS
+        retry_delay = 0.25
         while time.monotonic() < deadline:
-            value = await self._request("scenes", "/jobs/" + job_id + "?wait_ms=1000", timeout=5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                value = await self._request(
+                    "scenes", "/jobs/" + job_id + "?wait_ms=1000", timeout=min(POLL_TIMEOUT_SECONDS, remaining)
+                )
+            except ServiceError as error:
+                if error.code not in TRANSIENT_OBSERVATION_CODES:
+                    raise
+                # A busy scene thread can miss the HTTP deadline while the GPU
+                # succeeds. Retry this read, never repeat the accepted mutation.
+                await asyncio.sleep(min(retry_delay, max(0, deadline - time.monotonic())))
+                retry_delay = min(2.0, retry_delay * 2)
+                continue
+            retry_delay = 0.25
             if value["state"] == "succeeded":
                 return value["result"]
             if value["state"] in {"failed", "interrupted"}:
                 raise ServiceError(grpc.StatusCode.FAILED_PRECONDITION, value.get("error", "Scene worker failed"))
-            await asyncio.sleep(0.01)
-        raise ServiceError(
-            grpc.StatusCode.DEADLINE_EXCEEDED,
-            "Scene work is still retained on the simulator; inspect the worker receipt",
-        )
+            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        raise TimeoutError("Scene observation budget expired")

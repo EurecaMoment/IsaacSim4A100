@@ -11,9 +11,11 @@ from typing import Any
 
 import numpy as np
 import omni.usd
-from a100sim.app import Physics
-from a100sim.service_queue import finite, integer, persist
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
+
+from a100sim.app import Physics
+from a100sim.scenes.physics_state import snapshot_physics, validate_retained_poses
+from a100sim.service_queue import finite, integer, persist
 
 SESSION_ID = re.compile(r"[a-f0-9]{32}\Z")
 
@@ -189,7 +191,6 @@ class Sessions:
             if any(view.count != 1 for _, view in views):
                 raise ValueError("A declared dynamic body is absent from CUDA PhysX")
             physics.step(steps, dt)
-            physics.sync_usd()
             bodies = []
             for path, view in views:
                 pose = view.get_transforms().numpy()[0].copy()
@@ -203,10 +204,9 @@ class Sessions:
                         "angular_velocity_world_rad_s": velocity[3:].tolist(),
                     }
                 )
-                body_api = UsdPhysics.RigidBodyAPI(stage.GetPrimAtPath(path))
-                body_api.CreateVelocityAttr(Gf.Vec3f(*map(float, velocity[:3])))
-                # USD specifies angular velocity in degrees/second; tensors use radians.
-                body_api.CreateAngularVelocityAttr(Gf.Vec3f(*map(float, np.degrees(velocity[3:]))))
+            # suppressReadback leaves authored USD at initial poses even after
+            # sync_usd(). Freeze measured tensors into a separate stage instead.
+            frozen = snapshot_physics(stage, bodies).GetRootLayer()
             metadata.update(physics_tick=metadata["physics_tick"] + steps, dt=dt)
             metadata["observation"] = {
                 "bodies": bodies,
@@ -216,7 +216,6 @@ class Sessions:
                 "cpu_fallback": False,
             }
             persist(directory / "physics.json", metadata["observation"])
-            frozen = stage.Flatten()
             result = {**metadata["observation"], "steps": steps, "report": str(directory / "physics.json")}
         finally:
             physics.close()
@@ -283,6 +282,7 @@ class Sessions:
         spp = integer(values.get("spp", 32), "spp", 1, 256)
         if metadata["observation"] is None:
             raise ValueError("Settle the scene before capture")
+        validate_retained_poses(stage, metadata["observation"]["bodies"])
         from a100sim.usd_renderer import render_stage
 
         frames = []
@@ -305,6 +305,8 @@ class Sessions:
         """Export retained USD and optionally package its resolved dependencies."""
         if set(values) - {"format"} or values.get("format", "usd") not in {"usd", "usdz"}:
             raise ValueError("Scene export supports usd or usdz")
+        if metadata["observation"] is not None:
+            validate_retained_poses(stage, metadata["observation"]["bodies"])
         scene = directory / "scene.usdc"
         exported = Usd.Stage.Open(stage.Flatten())
         builtin = Path(os.environ["A100SIM_ROOT"]) / "packages/isaacsim/kit/mdl/core/Base"

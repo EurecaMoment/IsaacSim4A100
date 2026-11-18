@@ -9,23 +9,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from a100sim.network import require_loopback
+from a100sim.scenes.contracts import OPERATIONS
 from a100sim.service_queue import JobQueue, start_http
 
 if TYPE_CHECKING:
     from a100sim.scenes.sessions import Sessions
 
 LOGGER = logging.getLogger(__name__)
-
-OPERATIONS = {
-    "asset.import",
-    "scene.edit",
-    "physics.step",
-    "world.observe",
-    "scene.inspect",
-    "scene.capture",
-    "scene.export",
-    "scene.close",
-}
 
 
 class SceneQueue(JobQueue):
