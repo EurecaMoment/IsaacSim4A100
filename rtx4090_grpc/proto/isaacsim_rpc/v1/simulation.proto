@@ -1,0 +1,267 @@
+syntax = "proto3";
+
+package isaacsim_rpc.v1;
+
+// ============================================================================
+// Isaac Sim RTX 4090 gRPC 门面服务
+//
+// 一对一封装现有 HTTP 服务（默认 http://127.0.0.1:18409）的三个接口：
+//   GET  /health          -> SimulationService.Health
+//   POST /simulate        -> SimulationService.SubmitJob
+//   GET  /jobs/<job_id>   -> SimulationService.GetJob
+//
+// 字段语义与 HTTP JSON 保持一致；请求中未设置的字段由上游服务套用默认值。
+// ============================================================================
+
+service SimulationService {
+  // 服务健康检查与运行时元信息
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // 提交物理仿真 + 渲染任务，立即返回 job 句柄
+  rpc SubmitJob(SimulateRequest) returns (JobHandle);
+
+  // 查询任务状态；成功时同时返回产物路径与渲染元信息
+  rpc GetJob(GetJobRequest) returns (Job);
+}
+
+// ---------------------------------------------------------------------------
+// 基础类型
+// ---------------------------------------------------------------------------
+
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message QuatXYZW {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 场景描述
+// ---------------------------------------------------------------------------
+
+message BodySpec {
+  // 唯一标识，会作为语义分割标签名；留空则由服务端按索引生成
+  string id = 1;
+
+  // cube | sphere | mesh
+  string shape = 2;
+
+  // 世界坐标，单位米
+  Vec3 position = 3;
+
+  // 姿态四元数，xyzw 顺序
+  QuatXYZW orientation_xyzw = 4;
+
+  // 仅 cube：三轴尺寸（米）
+  Vec3 size = 5;
+
+  // 仅 sphere：半径（米）
+  optional double radius = 6;
+
+  // 质量（千克）
+  optional double mass = 7;
+
+  // 显示颜色，RGB，0~1
+  Vec3 color = 8;
+
+  // 仅 mesh：服务端绝对路径，目录内需包含 mesh.npz
+  optional string asset = 9;
+}
+
+message LightSpec {
+  Vec3 color = 1;
+  optional double intensity = 2;
+  optional double exposure = 3;
+  optional double width = 4;
+  optional double height = 5;
+  Vec3 origin = 6;
+  Vec3 target = 7;
+}
+
+message LightingSpec {
+  LightSpec dome = 1;
+  LightSpec key = 2;
+  repeated LightSpec fills = 3;
+}
+
+message RenderSpec {
+  // RTX 后端只支持 mesh
+  optional string kind = 1;
+
+  // 图像边长像素，上游允许 64~1024
+  optional uint32 size = 2;
+
+  // RTX 下表示子帧数，上游允许 1~256
+  optional uint32 spp = 3;
+
+  optional uint32 seed = 4;
+  optional double azimuth = 5;
+  optional double elevation = 6;
+  optional double distance = 7;
+  Vec3 target = 8;
+  optional double gaussian_gain = 9;
+  LightingSpec lighting = 10;
+}
+
+message CaptureSpec {
+  // 每 N 帧记录一次（1~steps）；与 frames 同时给出时取并集
+  optional uint32 every = 1;
+
+  // 指定帧号列表（1~steps，自动去重排序，最多 1200 项）
+  repeated uint32 frames = 2;
+  // 注：CaptureSpec 存在即强制逐帧渲染（RGB + depth + semantic + state），
+  // 每帧产物落到 frames/frame_XXXXXX/ 子目录；仅 RTX 后端支持。
+}
+
+message SimulateRequest {
+  // 留空表示使用上游默认场景（64 个立方体）
+  repeated BodySpec bodies = 1;
+
+  optional uint32 steps = 2;
+  optional double dt = 3;
+  optional double gravity = 4;
+  optional bool ground = 5;
+  RenderSpec render = 6;
+
+  // 中间帧采样；缺省时只输出尾帧（state.npz）
+  CaptureSpec capture = 7;
+}
+
+// ---------------------------------------------------------------------------
+// 任务句柄与结果
+// ---------------------------------------------------------------------------
+
+message JobHandle {
+  string id = 1;
+  string state = 2;
+  double queued_at = 3;
+}
+
+message GetJobRequest {
+  // 32 位小写十六进制
+  string job_id = 1;
+}
+
+message BodyState {
+  string id = 1;
+  string prim_path = 2;
+
+  // [x, y, z, qx, qy, qz, qw]
+  repeated double pose_xyzw = 3;
+
+  // [vx, vy, vz, wx, wy, wz]
+  repeated double velocity = 4;
+}
+
+// 单帧状态快照（仿真过程中边模拟边落盘）
+message FrameArtifact {
+  uint32 frame = 1;
+  string state_npz = 2;
+
+  // 以下仅在 capture.render=true 时填充
+  string image = 3;
+  string depth_m = 4;
+  string semantic_ids = 5;
+  string semantic_labels = 6;
+}
+
+// 产物位于服务端文件系统，返回绝对路径
+message Artifacts {
+  string state_npz = 1;
+  string scene = 2;
+  string simulation_json = 3;
+  string image = 4;
+  string depth_m = 5;
+  string semantic_ids = 6;
+  string semantic_labels = 7;
+
+  // 按帧采样的状态列表；未配置 capture 时为空
+  repeated FrameArtifact frames = 8;
+}
+
+message RenderInfo {
+  string backend = 1;
+  string renderer = 2;
+  bool native_rtx = 3;
+  uint32 size = 4;
+  uint32 requested_spp = 5;
+  uint32 rt_subframes = 6;
+  string sampling = 7;
+  string image = 8;
+  string depth_m = 9;
+  string depth_convention = 10;
+  string semantic_ids = 11;
+  string semantic_labels = 12;
+  double rgb_mean = 13;
+  double seconds = 14;
+}
+
+message Job {
+  string id = 1;
+
+  // queued | running | succeeded | failed | interrupted
+  string state = 2;
+
+  double queued_at = 3;
+  double started_at = 4;
+  double finished_at = 5;
+  double queue_seconds = 6;
+  double execution_seconds = 7;
+  string error = 8;
+
+  // ---- 仿真结果（任务成功后填充）----
+  string isaac_sim = 9;
+  string physics_device = 10;
+  int32 physical_gpu = 11;
+  bool native_rtx = 12;
+  bool cpu_fallback = 13;
+  uint32 rigid_bodies = 14;
+  uint32 steps = 15;
+  double dt = 16;
+  double simulation_seconds = 17;
+  double setup_seconds = 18;
+  double physics_seconds = 19;
+  string collision = 20;
+  repeated BodyState bodies = 21;
+
+  Artifacts artifacts = 22;
+  RenderInfo render = 23;
+}
+
+// ---------------------------------------------------------------------------
+// 健康检查
+// ---------------------------------------------------------------------------
+
+message HealthRequest {}
+
+message HealthResponse {
+  // ready | initializing | failed
+  string status = 1;
+  string engine = 2;
+  int32 physical_gpu = 3;
+  bool cuda_required = 4;
+  bool cpu_fallback = 5;
+  bool native_rtx = 6;
+  string render_backend = 7;
+  string gpu_model = 8;
+  string gpu_uuid = 9;
+  string isaac_sim = 10;
+  string renderer = 11;
+  repeated string supported_shapes = 12;
+  repeated string annotators = 13;
+  double uptime_seconds = 14;
+  uint32 queue_depth = 15;
+  uint32 queue_capacity = 16;
+  string active_job = 17;
+  uint32 completed = 18;
+  uint32 failed = 19;
+
+  // 仅在引擎初始化失败时出现（status=failed）
+  string error = 20;
+}
