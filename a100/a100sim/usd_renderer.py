@@ -1,6 +1,6 @@
 """Render a live Isaac USD stage on CUDA without the RTX renderer.
 
-This adapter covers meshes with displayColor, cubes, perspective cameras,
+This adapter covers polygon meshes and USD solid primitives, perspective cameras,
 constant dome lights and rectangular lights. A mesh may provide a standard
 3DGS PLY via a100sim:gaussianAsset. Unsupported render schemas raise an error
 instead of silently dropping them. This is an external renderer adapter, not
@@ -35,7 +35,48 @@ def mesh_shape(prim, matrix):
     return native_mesh(prim, matrix)
 
 
-def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0, annotations=False):
+def solid_shape(prim, matrix):
+    """Tessellate round USD solids, preserving their authored axis and caps."""
+    kind = prim.GetTypeName()
+    schema = {"Capsule": UsdGeom.Capsule, "Cylinder": UsdGeom.Cylinder, "Cone": UsdGeom.Cone}[kind](prim)
+    radius, height = float(schema.GetRadiusAttr().Get()), float(schema.GetHeightAttr().Get())
+    axis = str(schema.GetAxisAttr().Get())
+    segments = 32
+    if kind == "Capsule":
+        rings = [(radius * math.cos(a), -height / 2 + radius * math.sin(a))
+                 for a in np.linspace(-math.pi / 2, 0, 9)]
+        rings += [(radius * math.cos(a), height / 2 + radius * math.sin(a))
+                  for a in np.linspace(0, math.pi / 2, 9)]
+    elif kind == "Cylinder":
+        rings = [(0, -height / 2), (radius, -height / 2), (radius, height / 2), (0, height / 2)]
+    else:
+        rings = [(0, -height / 2), (radius, -height / 2), (0, height / 2)]
+    points = np.asarray([[r * math.cos(a), r * math.sin(a), z]
+                         for r, z in rings for a in np.linspace(0, 2 * math.pi, segments, endpoint=False)])
+    if axis == "X":
+        points = points[:, [2, 0, 1]]
+    elif axis == "Y":
+        points = points[:, [1, 2, 0]]
+    elif axis != "Z":
+        raise ValueError(f"Unsupported USD primitive axis: {axis}")
+    faces = []
+    for ring in range(len(rings) - 1):
+        for j in range(segments):
+            a, b = ring * segments + j, ring * segments + (j + 1) % segments
+            c, d = a + segments, b + segments
+            faces.extend(((a, b, d), (a, d, c)))
+    props = mi.Properties()
+    props["bsdf"] = surface_material(prim)
+    shape = mi.Mesh(str(prim.GetPath()), vertex_count=len(points), face_count=len(faces), props=props)
+    params = mi.traverse(shape)
+    params["vertex_positions"] = (points @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32).reshape(-1)
+    params["faces"] = np.asarray(faces, np.uint32).reshape(-1)
+    params.update()
+    return shape
+
+
+def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0,
+                 annotations=False, cameras=None):
     if mi.variant() != "cuda_ad_rgb" or not dr.has_backend(dr.JitBackend.CUDA):
         raise RuntimeError("A100 CUDA backend is required")
     if mode not in ("mesh", "gaussian"):
@@ -75,11 +116,13 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
         scene["integrator"]["max_events"] = 512
         scene["integrator"]["gaussian_gain"] = float(gaussian_gain)
     sources, unsupported = [], []
-    for prim in stage.Traverse():
+    for prim in Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies()):
         if not prim.IsActive():
             continue
         imageable = UsdGeom.Imageable(prim)
         if imageable and imageable.ComputeVisibility() == UsdGeom.Tokens.invisible:
+            continue
+        if imageable and imageable.ComputePurpose() in (UsdGeom.Tokens.guide, UsdGeom.Tokens.proxy):
             continue
         key = str(prim.GetPath()).replace("/", "_")
         matrix = world_matrix(prim, cache) if prim.IsA(UsdGeom.Xformable) else np.eye(4)
@@ -122,6 +165,9 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
                 "bsdf": surface_material(prim),
             }
             sources.append({"prim": str(prim.GetPath()), "kind": "cube", "world_matrix": matrix.tolist()})
+        elif prim.GetTypeName() in ("Capsule", "Cylinder", "Cone"):
+            scene[key] = solid_shape(prim, matrix)
+            sources.append({"prim": str(prim.GetPath()), "kind": prim.GetTypeName().lower(), "world_matrix": matrix.tolist()})
         elif prim.IsA(UsdLux.DomeLight) or prim.IsA(UsdLux.RectLight):
             light = UsdLux.LightAPI(prim)
             rgb = np.asarray(light.GetColorAttr().Get(), np.float64)
@@ -146,7 +192,28 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
             unsupported.append(f"{prim.GetPath()} ({prim.GetTypeName()})")
     if unsupported:
         raise ValueError("Unsupported USD rendering schemas: " + ", ".join(unsupported))
+    camera_specs = None
+    if cameras is not None:
+        camera_specs = []
+        for path in cameras:
+            selected = UsdGeom.Camera.Get(stage, path)
+            if not selected or selected.GetProjectionAttr().Get() != "perspective":
+                raise ValueError(f"A perspective USD camera is required: {path}")
+            matrix = world_matrix(selected.GetPrim(), cache)
+            angle = math.degrees(2 * math.atan(float(selected.GetHorizontalApertureAttr().Get()) /
+                                               (2 * float(selected.GetFocalLengthAttr().Get()))))
+            sensor = {**scene["sensor"], "fov": angle, "to_world": mi.ScalarTransform4f.look_at(
+                origin=matrix[:3, 3], target=matrix[:3, 3] - matrix[:3, 2], up=matrix[:3, 1])}
+            camera_specs.append((path, matrix, angle, sensor))
+        batch = {"type": "batch", "film": {**scene["sensor"]["film"], "width": size * len(cameras)}}
+        for index, (_, _, _, sensor) in enumerate(camera_specs):
+            batch[f"camera_{index:04d}"] = {key: value for key, value in sensor.items() if key != "film"}
+        scene["sensor"] = batch
     scene = mi.load_dict(scene)
+    surface_ids = None
+    if annotations:
+        from .annotations import prepare_surface_ids
+        surface_ids = prepare_surface_ids(scene, stage, sources)
     setup_seconds = time.perf_counter() - started
     tick = time.perf_counter()
     image = mi.render(scene, spp=spp, seed=seed)
@@ -155,12 +222,38 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
     render_seconds = time.perf_counter() - tick
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if camera_specs is not None:
+        # One acceleration structure and one CUDA wavefront launch for all views.
+        # Read back once, then encode images independently of the simulation owner.
+        pixels = np.asarray(image).copy()
+        frames = []
+        annotation_seconds = 0.0
+        for index, (path, matrix, angle, sensor_config) in enumerate(camera_specs):
+            destination = output / f"camera-{index:03d}.png"
+            mi.util.write_bitmap(str(destination), pixels[:, index * size:(index + 1) * size], write_async=False)
+            annotation_result = None
+            if annotations:
+                from .annotations import capture_primary_surfaces
+                tick = time.perf_counter()
+                annotation_result = capture_primary_surfaces(
+                    scene, stage, sources, matrix, destination.with_suffix(""),
+                    sensor=mi.load_dict(sensor_config), surface_ids=surface_ids)
+                annotation_seconds += time.perf_counter() - tick
+            frames.append({"image": str(destination), "camera": path, "camera_world": matrix.tolist(),
+                           "fov_degrees": angle, "resolution": [size, size], "spp": spp,
+                           "mode": mode, "native_rtx": False, "cpu_fallback": False,
+                           **({"annotations": annotation_result} if annotation_result else {})})
+        return {"frames": frames, "setup_seconds": setup_seconds, "render_seconds": render_seconds,
+                "annotation_seconds": annotation_seconds, "camera_parallelism": len(cameras),
+                "geometry_builds": 1, "render_launches": 1, "usd_sources": sources,
+                "renderer": "A100 CUDA batch sensor", "native_rtx": False, "cpu_fallback": False}
     mi.util.write_bitmap(str(output), image, write_async=False)
     annotation_result = None
     if annotations:
         from .annotations import capture_primary_surfaces
 
-        annotation_result = capture_primary_surfaces(scene, stage, sources, camera_world, output.with_suffix(""))
+        annotation_result = capture_primary_surfaces(scene, stage, sources, camera_world, output.with_suffix(""),
+                                                     surface_ids=surface_ids)
     return {
         "mode": mode,
         "renderer": "A100 CUDA USD adapter",
@@ -178,3 +271,9 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
         "usd_sources": sources,
         **({"annotations": annotation_result} if annotation_result else {}),
     }
+
+
+def render_cameras(stage, cameras, directory, size=512, spp=32, annotations=True):
+    """Render simultaneous camera views while sharing scene/BVH and CUDA work."""
+    return render_stage(stage, cameras[0], "mesh", directory, size=size, spp=spp,
+                        annotations=annotations, cameras=cameras)
