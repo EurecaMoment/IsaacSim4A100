@@ -67,16 +67,35 @@ class JobQueue:
         self.completed = 0
         self.failed = 0
         self.details = {}
+        # A planned scene-worker upgrade can reclaim selected queued jobs and a
+        # read-only capture. All mutations already in progress remain interrupted.
+        manifest = self.output / ".planned-restart.json"
+        allowed = set(json.loads(manifest.read_text())) if manifest.is_file() else set()
+        resume = []
         # A lost process must never cause automatic duplicate simulation.
         for path in self.output.glob("*/job.json"):
             try:
                 record = json.loads(path.read_text())
                 if record.get("state") in {"queued", "running"}:
+                    if path.parent.name in allowed:
+                        payload = json.loads((path.parent / "request.json").read_text())
+                        if record["state"] == "queued" or payload.get("operation") == "scene.capture":
+                            resume.append((record["queued_at"], path, record, payload))
+                            continue
                     record.update(state="interrupted", error="Service restarted; job was not retried",
                                   finished_at=time.time())
                     persist(path, record)
             except (OSError, ValueError):
                 continue
+
+        if len(resume) > capacity:
+            raise RuntimeError("Planned restart list exceeds queue capacity")
+        for _, path, record, payload in sorted(resume, key=lambda item: item[0]):
+            record.update(state="queued")
+            persist(path, record)
+            self.jobs.put_nowait((record["id"], payload))
+        if manifest.is_file():
+            manifest.unlink()
 
     def prepare(self, value):
         return value

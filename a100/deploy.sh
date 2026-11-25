@@ -212,6 +212,7 @@ deploy_runtime() {
         bash "$code_root/build-drjit.sh"
         bash "$code_root/doctor.sh" --runtime
     fi
+    bash "$code_root/build-door-pbr.sh"
     bash "$code_root/run-physics-fixed.sh" "$code_root/scripts/smoke_gpu.py" \
         --output "$A100SIM_ROOT/results/deploy-smoke"
 

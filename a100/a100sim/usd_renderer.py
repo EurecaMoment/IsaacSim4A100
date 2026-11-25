@@ -1,4 +1,4 @@
-"""Render a live Isaac USD stage on CUDA without the RTX renderer.
+"""Render a live Isaac USD stage without requiring an RTX renderer.
 
 This adapter covers polygon meshes and USD solid primitives, perspective cameras,
 constant dome lights and rectangular lights. A mesh may provide a standard
@@ -8,6 +8,7 @@ a replacement implementation of Isaac Replicator or RTX sensor extensions.
 """
 
 import math
+import os
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import mitsuba as mi
 import numpy as np
 from pxr import Usd, UsdGeom, UsdLux
 
-mi.set_variant("cuda_ad_rgb")
+mi.set_variant(os.environ.get("A100SIM_RENDER_VARIANT", "scalar_rgb"))
 from . import hybrid_integrator
 from .gaussian import load_gaussians, shape_dict
 from .materials import MATERIAL_CHANNELS, read_usd_material, read_mesh_channels
@@ -75,46 +76,8 @@ def solid_shape(prim, matrix):
     return shape
 
 
-def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0,
-                 annotations=False, cameras=None):
-    if mi.variant() != "cuda_ad_rgb" or not dr.has_backend(dr.JitBackend.CUDA):
-        raise RuntimeError("A100 CUDA backend is required")
-    if mode not in ("mesh", "gaussian"):
-        raise ValueError("mode must be mesh or gaussian")
-    if annotations and mode != "mesh":
-        raise ValueError("Primary-surface annotations currently require mesh mode")
-    started = time.perf_counter()
-    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    camera = UsdGeom.Camera.Get(stage, camera_path)
-    if not camera or camera.GetProjectionAttr().Get() != "perspective":
-        raise ValueError("a perspective USD camera is required")
-    camera_world = world_matrix(camera.GetPrim(), cache)
-    origin = camera_world[:3, 3]
-    fov = math.degrees(
-        2 * math.atan(float(camera.GetHorizontalApertureAttr().Get()) / (2 * float(camera.GetFocalLengthAttr().Get())))
-    )
-    scene = {
-        "type": "scene",
-        "integrator": {"type": "a100_hybrid_path" if mode == "gaussian" else "path", "max_depth": 6},
-        "sensor": {
-            "type": "perspective",
-            "fov": fov,
-            "fov_axis": "x",
-            "to_world": mi.ScalarTransform4f.look_at(
-                origin=origin, target=origin - camera_world[:3, 2], up=camera_world[:3, 1]
-            ),
-            "film": {
-                "type": "hdrfilm",
-                "width": size,
-                "height": size,
-                "pixel_format": "rgb",
-                "rfilter": {"type": "box"},
-            },
-        },
-    }
-    if mode == "gaussian":
-        scene["integrator"]["max_events"] = 512
-        scene["integrator"]["gaussian_gain"] = float(gaussian_gain)
+def add_stage_geometry(scene, stage, mode, cache):
+    """Compile visible geometry, materials and lights into a Mitsuba scene description."""
     sources, unsupported = [], []
     for prim in Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies()):
         if not prim.IsActive():
@@ -192,6 +155,73 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
             unsupported.append(f"{prim.GetPath()} ({prim.GetTypeName()})")
     if unsupported:
         raise ValueError("Unsupported USD rendering schemas: " + ", ".join(unsupported))
+    return sources
+
+
+def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0,
+                 annotations=False, cameras=None):
+    if mi.variant() not in {"cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb"}:
+        raise RuntimeError("Render variant must be cuda_ad_rgb, llvm_ad_rgb, or scalar_rgb")
+    expected_backend = {
+        "cuda_ad_rgb": dr.JitBackend.CUDA,
+        "llvm_ad_rgb": dr.JitBackend.LLVM,
+        "scalar_rgb": dr.JitBackend.Invalid,
+    }[mi.variant()]
+    if expected_backend != dr.JitBackend.Invalid and not dr.has_backend(expected_backend):
+        raise RuntimeError(f"The selected Mitsuba backend is unavailable: {mi.variant()}")
+    render_backend = mi.variant()
+    cpu_fallback = render_backend != "cuda_ad_rgb"
+    renderer = {
+        "cuda_ad_rgb": "Mitsuba CUDA path tracer",
+        "llvm_ad_rgb": "Mitsuba CPU LLVM path tracer",
+        "scalar_rgb": "Mitsuba CPU scalar path tracer",
+    }[render_backend]
+    if mode not in ("mesh", "gaussian"):
+        raise ValueError("mode must be mesh or gaussian")
+    if annotations and mode != "mesh":
+        raise ValueError("Primary-surface annotations currently require mesh mode")
+    started = time.perf_counter()
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    camera = UsdGeom.Camera.Get(stage, camera_path)
+    if not camera or camera.GetProjectionAttr().Get() != "perspective":
+        raise ValueError("a perspective USD camera is required")
+    camera_world = world_matrix(camera.GetPrim(), cache)
+    origin = camera_world[:3, 3]
+    fov = math.degrees(
+        2 * math.atan(float(camera.GetHorizontalApertureAttr().Get()) / (2 * float(camera.GetFocalLengthAttr().Get())))
+    )
+    scene = {
+        "type": "scene",
+        "integrator": {"type": "a100_hybrid_path" if mode == "gaussian" else "path", "max_depth": 6},
+        "sensor": {
+            "type": "perspective",
+            "fov": fov,
+            "fov_axis": "x",
+            "to_world": mi.ScalarTransform4f.look_at(
+                origin=origin, target=origin - camera_world[:3, 2], up=camera_world[:3, 1]
+            ),
+            "film": {
+                "type": "hdrfilm",
+                "width": size,
+                "height": size,
+                "pixel_format": "rgb",
+                "rfilter": {"type": "box"},
+            },
+        },
+    }
+    # Bound temporary wavefront storage on CPU while retaining the requested
+    # total sample count. Mitsuba accumulates all passes into the same film.
+    if render_backend == "llvm_ad_rgb":
+        film_pixels = size * size * (len(cameras) if cameras is not None else 1)
+        max_pass_spp = max(1, (4 * 1024 * 1024) // film_pixels)
+        if spp > max_pass_spp:
+            scene["integrator"]["samples_per_pass"] = next(
+                count for count in range(max_pass_spp, 0, -1) if spp % count == 0
+            )
+    if mode == "gaussian":
+        scene["integrator"]["max_events"] = 512
+        scene["integrator"]["gaussian_gain"] = float(gaussian_gain)
+    sources = add_stage_geometry(scene, stage, mode, cache)
     camera_specs = None
     if cameras is not None:
         camera_specs = []
@@ -241,12 +271,14 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
                 annotation_seconds += time.perf_counter() - tick
             frames.append({"image": str(destination), "camera": path, "camera_world": matrix.tolist(),
                            "fov_degrees": angle, "resolution": [size, size], "spp": spp,
-                           "mode": mode, "native_rtx": False, "cpu_fallback": False,
+                           "mode": mode, "native_rtx": False, "cpu_fallback": cpu_fallback,
+                           "render_backend": render_backend,
                            **({"annotations": annotation_result} if annotation_result else {})})
         return {"frames": frames, "setup_seconds": setup_seconds, "render_seconds": render_seconds,
                 "annotation_seconds": annotation_seconds, "camera_parallelism": len(cameras),
                 "geometry_builds": 1, "render_launches": 1, "usd_sources": sources,
-                "renderer": "A100 CUDA batch sensor", "native_rtx": False, "cpu_fallback": False}
+                "renderer": renderer, "render_backend": render_backend,
+                "native_rtx": False, "cpu_fallback": cpu_fallback}
     mi.util.write_bitmap(str(output), image, write_async=False)
     annotation_result = None
     if annotations:
@@ -256,9 +288,10 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
                                                      surface_ids=surface_ids)
     return {
         "mode": mode,
-        "renderer": "A100 CUDA USD adapter",
+        "renderer": renderer,
+        "render_backend": render_backend,
         "native_rtx": False,
-        "cpu_fallback": False,
+        "cpu_fallback": cpu_fallback,
         "resolution": [size, size],
         "spp": spp,
         "gaussian_gain": float(gaussian_gain) if mode == "gaussian" else None,

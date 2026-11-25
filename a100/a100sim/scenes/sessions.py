@@ -272,31 +272,9 @@ class Sessions:
         self, stage: Usd.Stage, metadata: dict[str, Any], values: dict[str, Any], directory: Path
     ) -> dict[str, Any]:
         """Render authored cameras and annotations from the same settled stage."""
-        if set(values) - {"cameras", "size", "spp", "annotations"}:
-            raise ValueError("Unsupported capture fields")
-        cameras = values.get("cameras")
-        if not isinstance(cameras, list) or not 1 <= len(cameras) <= 32:
-            raise ValueError("Capture requires 1 to 32 authored cameras")
-        size = integer(values.get("size", 768), "size", 64, 1024)
-        spp = integer(values.get("spp", 32), "spp", 1, 256)
-        if metadata["observation"] is None:
-            raise ValueError("Settle the scene before capture")
-        validate_retained_poses(stage, metadata["observation"]["bodies"])
-        from a100sim.usd_renderer import render_stage
+        from a100sim.scenes.capture_worker import run_capture
 
-        frames = []
-        for index, camera in enumerate(cameras):
-            prim_path(camera)
-            image = directory / f"view_{index}.png"
-            frame = render_stage(
-                stage, camera, "mesh", image, size=size, spp=spp, annotations=values.get("annotations", True)
-            )
-            frame["image"] = str(image)
-            for name, value in frame.get("annotations", {}).items():
-                if name in {"arrays", "labels"}:
-                    frame["annotations"][name] = str(directory / value)
-            frames.append(frame)
-        return {"frames": frames, "physics_tick": metadata["physics_tick"], "cpu_fallback": False}
+        return run_capture(stage, metadata, values, directory)
 
     def scene_export(
         self, stage: Usd.Stage, metadata: dict[str, Any], values: dict[str, Any], directory: Path

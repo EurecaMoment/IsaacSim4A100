@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import queue
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from a100sim.network import require_loopback
+from a100sim.scenes.capture_pool import CapturePool
 from a100sim.scenes.contracts import OPERATIONS
 from a100sim.service_queue import JobQueue, start_http
 
@@ -19,9 +21,36 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SceneQueue(JobQueue):
-    """Run registered scene actions serially within the owning Kit process."""
+    """Serialize Kit mutations and dispatch immutable captures to bounded workers."""
 
     sessions: Sessions
+
+    captures = None
+
+    def submit(self, value):
+        with self.lock:
+            if self.captures and self.jobs.qsize() + len(self.captures.pending) >= self.jobs.maxsize:
+                raise queue.Full()
+            return super().submit(value)
+
+    def run_one(self, item):
+        if self.captures and item[1]["operation"] == "scene.capture":
+            self.captures.dispatch(*item)
+        else:
+            super().run_one(item)
+
+    def health(self):
+        with self.lock:
+            health = super().health()
+            if self.captures:
+                active = sorted(self.captures.running)
+                if self.active:
+                    active.append(self.active)
+                health.update(active_jobs=active, active_job=self.active or next(iter(active), None),
+                              queue_depth=self.jobs.qsize() + len(self.captures.pending),
+                              capture_workers=self.captures.workers, capture_threads=self.captures.threads,
+                              capture_running=len(self.captures.running), capture_pending=len(self.captures.pending))
+            return health
 
     def prepare(self, value: dict[str, Any]) -> dict[str, Any]:
         """Reject unregistered actions before accepting a worker job."""
@@ -54,6 +83,7 @@ def main() -> None:
         from a100sim.scenes.sessions import Sessions
 
         state.sessions = Sessions(args.output / "sessions")
+        state.captures = CapturePool(state)
         state.details = {
             "operations": sorted(OPERATIONS),
             "max_cameras": 32,
@@ -65,6 +95,8 @@ def main() -> None:
     finally:
         state.ready = False
         server.shutdown()
+        if state.captures:
+            state.captures.executor.shutdown(wait=True)
         app.close()
 
 

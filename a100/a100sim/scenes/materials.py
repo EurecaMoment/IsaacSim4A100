@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import drjit as dr
 import mitsuba as mi
 import numpy as np
 from a100sim.materials import read_usd_material
@@ -61,6 +62,101 @@ def bitmap(
     }
 
 
+class DoorColor(mi.Texture):
+    """Evaluate MI_DoorA's ordered RGB mask blends after filtering its textures."""
+
+    def __init__(self, base, mask, colors):
+        super().__init__(mi.Properties())
+        self.base, self.mask, self.colors = base, mask, colors
+
+    def eval_3(self, si, active=True):
+        mask = self.mask.eval_3(si, active)
+        tint = self.colors[3]
+        for channel in range(3):
+            tint = dr.lerp(tint, self.colors[channel], mask[channel])
+        return self.base.eval_3(si, active) * tint
+
+    eval = eval_3
+
+    def eval_1(self, si, active=True):
+        return mi.luminance(self.eval_3(si, active))
+
+    def is_spatially_varying(self):
+        return True
+
+    def to_string(self):
+        return "MI_DoorA masked base color"
+
+
+class DoorNormal(mi.Texture):
+    """Unpack the filtered XY normal channels used by OmniUe4Base."""
+
+    def __init__(self, normal):
+        super().__init__(mi.Properties())
+        self.normal = normal
+
+    def eval_3(self, si, active=True):
+        sample = self.normal.eval_3(si, active)
+        x, y = 2 * sample.x - 1, 2 * sample.y - 1
+        z = dr.sqrt(dr.maximum(0, 1 - x * x - y * y))
+        # OmniUe4Base uses tangent_u * x - tangent_v * y + normal * z.
+        return 0.5 * (mi.Color3f(x, -y, z) + 1)
+
+    def is_spatially_varying(self):
+        return True
+
+    def to_string(self):
+        return "MI_DoorA tangent-space normal"
+
+
+def door_surface(shader: UsdShade.Shader) -> dict[str, Any]:
+    """Translate the registered MI_DoorA program and its USD instance overrides."""
+    defaults = {
+        "BaseColor": "T_PanicDoor_bc.png",
+        "ColorMask": "T_PanicDoor_mask.png",
+        "Normal": "T_PanicDoor_n.png",
+        "AO_R_Rough_G_Metallic_B_": "T_PanicDoor_ao_r_m_e.png",
+    }
+    mdl = shader.GetSourceAsset("mdl")
+    paths = {}
+    for name, filename in defaults.items():
+        path = texture_path(shader, name)
+        if path is None:
+            fallback = Path(mdl.resolvedPath or mdl.path).parent / "Textures" / filename
+            if not fallback.is_file():
+                raise ValueError(f"Native MI_DoorA texture is unavailable: {fallback}")
+            path = str(fallback)
+        paths[name] = path
+    colors = [list(input_value(shader, f"Color0{i}", (1, 1, 1, 1)))[:3] for i in range(1, 5)]
+    base = mi.load_dict(bitmap(paths["BaseColor"]))
+    native_scalar = mi.variant() == "scalar_rgb"
+    if any(color != [1, 1, 1] for color in colors):
+        mask = mi.load_dict(bitmap(paths["ColorMask"], raw=True))
+        tints = [mi.Color3f(color) for color in colors]
+        if native_scalar:
+            base = mi.load_dict({
+                "type": "bf_door_pbr", "image": base, "mask": mask,
+                **{f"color{i}": tint for i, tint in enumerate(tints)},
+            })
+        else:
+            base = DoorColor(base, mask, tints)
+    normal = mi.load_dict(bitmap(paths["Normal"], raw=True))
+    normal = (mi.load_dict({"type": "bf_door_pbr", "image": normal})
+              if native_scalar else DoorNormal(normal))
+    orm = paths["AO_R_Rough_G_Metallic_B_"]
+    return {
+        "type": "normalmap",
+        "normalmap": normal,
+        "material": {
+            "type": "principled",
+            "base_color": base,
+            "roughness": bitmap(orm, channel=1, raw=True),
+            "metallic": bitmap(orm, channel=2, raw=True),
+            "specular": 0.5,
+        },
+    }
+
+
 def native_surface(
     prim: Usd.Prim, *, vertex_color: bool = False, channels: tuple[str, ...] = ()
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -70,6 +166,8 @@ def native_surface(
     if not shader:
         return read_usd_material(prim, vertex_color=vertex_color, channels=channels), None
     source = str(shader.GetPrim().GetAttribute("info:mdl:sourceAsset:subIdentifier").Get())
+    if source == "MI_DoorA":
+        return door_surface(shader), None
     if source not in {"OmniPBR", "MI_Props", "MI_TrashCan", "MI_Clock", "MI_DoorEntrance_glass"}:
         raise ValueError(f"No faithful PBR mapping for native material {source}")
     omni = source == "OmniPBR"

@@ -76,6 +76,56 @@ class SceneContractTests(unittest.TestCase):
         self.assertEqual(PARAMETER_SCHEMAS["scene.export"]["properties"]["format"]["enum"], ["usd", "usdz"])
         self.assertEqual(PARAMETER_SCHEMAS["scene.close"]["properties"]["delete"]["enum"], [False])
 
+    def test_scene_capture_advertises_extended_size_and_spp_limits(self) -> None:
+        capture = PARAMETER_SCHEMAS["scene.capture"]["properties"]
+        self.assertEqual((capture["size"]["minimum"], capture["size"]["maximum"]), (64, 2048))
+        self.assertEqual((capture["spp"]["minimum"], capture["spp"]["maximum"]), (1, 1024))
+        self.assertEqual(integer(2048, "size", 64, 2048), 2048)
+        self.assertEqual(integer(1024, "spp", 1, 1024), 1024)
+        for value, name, low, high in ((2049, "size", 64, 2048), (1025, "spp", 1, 1024)):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                integer(value, name, low, high)
+
+    def test_scene_capture_worker_applies_advertised_limits(self) -> None:
+        root = str(Path(__file__).resolve().parents[1])
+        code = f"""
+import sys
+import types
+sys.path.insert(0, {root!r})
+sys.modules["numpy"] = types.ModuleType("numpy")
+pxr = types.ModuleType("pxr")
+for name in ("Gf", "Sdf", "Usd", "UsdGeom", "UsdPhysics", "UsdShade", "UsdUtils"):
+    setattr(pxr, name, types.SimpleNamespace())
+sys.modules["pxr"] = pxr
+omni = types.ModuleType("omni")
+omni.__path__ = []
+omni_usd = types.ModuleType("omni.usd")
+omni.usd = omni_usd
+sys.modules["omni"] = omni
+sys.modules["omni.usd"] = omni_usd
+
+from pathlib import Path
+from a100sim.scenes.sessions import Sessions
+
+session = Sessions.__new__(Sessions)
+metadata = {{"observation": None}}
+def validate(size, spp):
+    try:
+        session.scene_capture(
+            None,
+            metadata,
+            {{"cameras": ["/World/Camera"], "size": size, "spp": spp}},
+            Path("."),
+        )
+    except ValueError as error:
+        return str(error)
+    raise AssertionError("scene capture should require a settled stage")
+assert validate(2048, 1024) == "Settle the scene before capture"
+assert validate(2049, 1024).startswith("size must be between 64 and 2048")
+assert validate(2048, 1025).startswith("spp must be between 1 and 1024")
+"""
+        subprocess.check_output([sys.executable, "-S", "-c", code], text=True)
+
     def test_returned_cursor_strings_are_valid_offsets(self) -> None:
         cursor = PARAMETER_SCHEMAS["scene.inspect"]["properties"]["cursor"]
         self.assertEqual({variant["type"] for variant in cursor["anyOf"]}, {"integer", "string"})
