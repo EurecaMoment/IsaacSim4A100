@@ -13,7 +13,7 @@ class PortabilityTests(unittest.TestCase):
     """Keep auto detection from bypassing allocations or requiring a newer graph API."""
 
     def test_selection_respects_masks_even_with_an_explicit_gpu(self) -> None:
-        devices = [GPU("0", "GPU-a", "NVIDIA A100", "test"), GPU("1", "GPU-b", "NVIDIA A100", "test")]
+        devices = [GPU("0", "GPU-a", "NVIDIA A100", "test", "8.0"), GPU("1", "GPU-b", "NVIDIA A800", "test", "8.0")]
         self.assertEqual(select_gpu(devices, visible="1").uuid, "GPU-b")
         self.assertEqual(select_gpu(devices, visible="GPU-b").uuid, "GPU-b")
         with self.assertRaises(RuntimeError):
@@ -21,6 +21,17 @@ class PortabilityTests(unittest.TestCase):
         for mask in ("", "-1", "GPU-unallocated"):
             with self.subTest(mask=mask), self.assertRaises(RuntimeError):
                 select_gpu(devices, visible=mask)
+
+    def test_auto_selection_uses_supported_compute_capability(self) -> None:
+        devices = [
+            GPU("0", "GPU-a", "NVIDIA A100", "test", "8.0"),
+            GPU("1", "GPU-b", "NVIDIA A800", "test", "8.0"),
+            GPU("2", "GPU-c", "NVIDIA H100", "test", "9.0"),
+        ]
+        self.assertEqual(select_gpu(devices).uuid, "GPU-a")
+        self.assertEqual(select_gpu(devices, selection="1").uuid, "GPU-b")
+        with self.assertRaisesRegex(RuntimeError, "SM 8.0"):
+            select_gpu(devices, selection="2")
 
     def test_conditional_graphs_follow_the_driver_api(self) -> None:
         self.assertFalse(conditional_graphs_enabled(12020))

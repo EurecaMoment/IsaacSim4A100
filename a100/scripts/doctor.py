@@ -34,15 +34,20 @@ def main() -> None:
     checks["cuda_toolkit"] = (toolkit / "bin/nvcc").is_file()
     try:
         gpu = configured_gpu()
-        report["gpu"] = {"name": gpu.name, "driver": gpu.driver, "selection": "allowed A100"}
-        checks["allocated_a100"] = True
+        report["gpu"] = {
+            "name": gpu.name,
+            "driver": gpu.driver,
+            "compute_capability": gpu.compute_capability,
+            "selection": "allowed SM 8.0",
+        }
+        checks["allocated_supported_gpu"] = True
         version = read_cuda_driver_version()
         report["cuda_driver_api"] = version
         report["newton_conditional_graphs"] = conditional_graphs_enabled(
             version, os.environ.get("A100SIM_NEWTON_CONDITIONAL_GRAPHS", "auto")
         )
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
-        checks["allocated_a100"] = False
+        checks["allocated_supported_gpu"] = False
         errors.append(str(error))
     if shutil.which("unshare"):
         result = subprocess.run(["unshare", "-Ur", "-m", "true"], capture_output=True, text=True)
