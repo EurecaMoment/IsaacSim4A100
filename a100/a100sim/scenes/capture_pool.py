@@ -1,4 +1,5 @@
 """Bounded render admission, snapshot ownership, and durable capture receipts."""
+
 from __future__ import annotations
 
 import json
@@ -17,12 +18,24 @@ def resource_budget():
     cpus = len(os.sched_getaffinity(0))
     reserved = min(8, cpus // 4)
     threads = min(max(1, cpus - reserved), max(1, int(os.getenv("A100SIM_CAPTURE_THREADS", "8"))))
-    available = int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines()
-                         if line.startswith("MemAvailable:"))) * 1024
+    available = (
+        int(
+            next(
+                line.split()[1]
+                for line in Path("/proc/meminfo").read_text().splitlines()
+                if line.startswith("MemAvailable:")
+            )
+        )
+        * 1024
+    )
     # Allow 16 GiB per process for mesh expansion, textures and frame buffers.
     # Keep at least one fourth of available memory for Kit and other processes.
-    workers = min(16, max(1, int(os.getenv("A100SIM_CAPTURE_WORKERS", "16"))),
-                  max(1, (cpus - reserved) // threads), max(1, int(.75 * available) // (16 << 30)))
+    workers = min(
+        16,
+        max(1, int(os.getenv("A100SIM_CAPTURE_WORKERS", "16"))),
+        max(1, (cpus - reserved) // threads),
+        max(1, int(0.75 * available) // (16 << 30)),
+    )
     if os.getenv("A100SIM_RENDER_VARIANT", "scalar_rgb") == "cuda_ad_rgb":
         workers = 1  # All children inherit this Kit service's single visible GPU.
     return workers, threads
@@ -73,7 +86,7 @@ class CapturePool:
                 self.running.add(job_id)
                 record = state.status(job_id)
                 now = time.time()
-                record.update(state="running", started_at=now, queue_seconds=now-record["queued_at"])
+                record.update(state="running", started_at=now, queue_seconds=now - record["queued_at"])
                 persist(state.output / job_id / "job.json", record)
             result = render_snapshot(snapshot, state.output / job_id, self.threads)
         except Exception as exc:
@@ -96,7 +109,7 @@ class CapturePool:
                 else:
                     record.update(state="failed", error=str(error)[:1000])
                     state.failed += 1
-                record.update(finished_at=now, execution_seconds=now-record.get("started_at", now))
+                record.update(finished_at=now, execution_seconds=now - record.get("started_at", now))
                 persist(state.output / job_id / "job.json", record)
                 self.pending.discard(job_id)
                 self.running.discard(job_id)

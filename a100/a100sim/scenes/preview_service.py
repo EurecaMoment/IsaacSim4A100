@@ -1,14 +1,14 @@
 """Local HTTP service for versioned scene previews."""
 
 import argparse
-from collections import OrderedDict
-from concurrent.futures import Future
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import re
 import threading
 import time
+from collections import OrderedDict
+from concurrent.futures import Future
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -164,8 +164,7 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.lock:
             active = self.server.active - 1
             prepared = sum(f.done() for f in self.server.cache.values())
-        self.respond(200, {"status": "ok", "active": active, "capacity": self.server.capacity,
-                           "prepared": prepared})
+        self.respond(200, {"status": "ok", "active": active, "capacity": self.server.capacity, "prepared": prepared})
 
     def do_POST(self):
         if self.path not in {"/v1/prepare", "/v1/preview"}:
@@ -206,8 +205,16 @@ class Handler(BaseHTTPRequestHandler):
                 modes = [self.server.frame(scene, stage, version, cam, yaw, size, spp)[1] for cam, yaw in keys]
                 if stage_version(stage) != version:
                     raise StageChanged("Stage changed while preparing views")
-                return self.respond(200, {"version": version, "built": built, "views": len(keys),
-                                          "rendered": modes.count("miss"), "seconds": time.perf_counter()-started})
+                return self.respond(
+                    200,
+                    {
+                        "version": version,
+                        "built": built,
+                        "views": len(keys),
+                        "rendered": modes.count("miss"),
+                        "seconds": time.perf_counter() - started,
+                    },
+                )
             camera, yaw = view_key(payload, scene.cameras)
             png, cache_status = self.server.frame(scene, stage, version, camera, yaw, size, spp)
             if stage_version(stage) != version:
@@ -221,13 +228,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.log_error("Preview failed: %r", exc)
             return self.respond(500, {"error": str(exc)})
-        self.respond(200, png, "image/png", {"X-Scene-Version": version, "X-Preview-Cache": cache_status,
-                     "X-Preparation-Ms": round((ready-started)*1000, 2),
-                     "X-Render-Ms": round((time.perf_counter()-ready)*1000, 2)})
+        self.respond(
+            200,
+            png,
+            "image/png",
+            {
+                "X-Scene-Version": version,
+                "X-Preview-Cache": cache_status,
+                "X-Preparation-Ms": round((ready - started) * 1000, 2),
+                "X-Render-Ms": round((time.perf_counter() - ready) * 1000, 2),
+            },
+        )
 
 
 def main():
     import atexit
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--sessions", required=True, type=Path)
     parser.add_argument("--port", type=int, default=18325)
@@ -235,13 +251,14 @@ def main():
     parser.add_argument("--cache-size", type=int, default=8)
     args = parser.parse_args()
     from a100sim.app import create_app
+
     application = create_app()
     atexit.register(application.close)
-    from a100sim.scenes.preview_renderer import PreviewEngine
     import drjit as dr
+    from a100sim.scenes.preview_renderer import PreviewEngine
+
     dr.set_thread_count(16)
-    server = PreviewServer(("127.0.0.1", args.port), PreviewEngine(), args.sessions,
-                           args.capacity, args.cache_size)
+    server = PreviewServer(("127.0.0.1", args.port), PreviewEngine(), args.sessions, args.capacity, args.cache_size)
     with server:
         server.serve_forever()
 

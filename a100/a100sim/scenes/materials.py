@@ -134,15 +134,18 @@ def door_surface(shader: UsdShade.Shader) -> dict[str, Any]:
         mask = mi.load_dict(bitmap(paths["ColorMask"], raw=True))
         tints = [mi.Color3f(color) for color in colors]
         if native_scalar:
-            base = mi.load_dict({
-                "type": "bf_door_pbr", "image": base, "mask": mask,
-                **{f"color{i}": tint for i, tint in enumerate(tints)},
-            })
+            base = mi.load_dict(
+                {
+                    "type": "bf_door_pbr",
+                    "image": base,
+                    "mask": mask,
+                    **{f"color{i}": tint for i, tint in enumerate(tints)},
+                }
+            )
         else:
             base = DoorColor(base, mask, tints)
     normal = mi.load_dict(bitmap(paths["Normal"], raw=True))
-    normal = (mi.load_dict({"type": "bf_door_pbr", "image": normal})
-              if native_scalar else DoorNormal(normal))
+    normal = mi.load_dict({"type": "bf_door_pbr", "image": normal}) if native_scalar else DoorNormal(normal)
     orm = paths["AO_R_Rough_G_Metallic_B_"]
     return {
         "type": "normalmap",

@@ -1,19 +1,19 @@
 """Render an interactive view from the production USD geometry and materials."""
+
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from io import BytesIO
-import math
 from pathlib import Path
 from queue import LifoQueue
 
 import drjit as dr
 import mitsuba as mi
 import numpy as np
+from a100sim.usd_renderer import add_stage_geometry, world_matrix
 from PIL import Image
 from pxr import Usd, UsdGeom
-
-from a100sim.usd_renderer import add_stage_geometry, world_matrix
 
 
 class DirectPreview(mi.SamplingIntegrator):
@@ -63,14 +63,26 @@ class PreviewEngine:
             if camera.GetProjectionAttr().Get() != "perspective":
                 continue
             matrix = world_matrix(prim, cache)
-            fov = math.degrees(2 * math.atan(float(camera.GetHorizontalApertureAttr().Get()) /
-                                              (2 * float(camera.GetFocalLengthAttr().Get()))))
+            fov = math.degrees(
+                2
+                * math.atan(
+                    float(camera.GetHorizontalApertureAttr().Get()) / (2 * float(camera.GetFocalLengthAttr().Get()))
+                )
+            )
             cameras[str(prim.GetPath())] = {
-                "type": "perspective", "fov": fov, "fov_axis": "x",
-                "to_world": mi.ScalarTransform4f.look_at(origin=matrix[:3, 3],
-                    target=matrix[:3, 3] - matrix[:3, 2], up=matrix[:3, 1]),
-                "film": {"type": "hdrfilm", "width": size, "height": size,
-                         "pixel_format": "rgb", "rfilter": {"type": "box"}},
+                "type": "perspective",
+                "fov": fov,
+                "fov_axis": "x",
+                "to_world": mi.ScalarTransform4f.look_at(
+                    origin=matrix[:3, 3], target=matrix[:3, 3] - matrix[:3, 2], up=matrix[:3, 1]
+                ),
+                "film": {
+                    "type": "hdrfilm",
+                    "width": size,
+                    "height": size,
+                    "pixel_format": "rgb",
+                    "rfilter": {"type": "box"},
+                },
             }
         if not cameras:
             raise ValueError("Scene contains no perspective cameras")
@@ -104,4 +116,3 @@ class PreviewEngine:
         encoded = BytesIO()
         Image.fromarray(pixels).save(encoded, format="PNG", compress_level=0)
         return encoded.getvalue()
-

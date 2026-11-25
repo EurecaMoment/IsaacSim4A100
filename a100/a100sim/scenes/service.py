@@ -46,10 +46,15 @@ class SceneQueue(JobQueue):
                 active = sorted(self.captures.running)
                 if self.active:
                     active.append(self.active)
-                health.update(active_jobs=active, active_job=self.active or next(iter(active), None),
-                              queue_depth=self.jobs.qsize() + len(self.captures.pending),
-                              capture_workers=self.captures.workers, capture_threads=self.captures.threads,
-                              capture_running=len(self.captures.running), capture_pending=len(self.captures.pending))
+                health.update(
+                    active_jobs=active,
+                    active_job=self.active or next(iter(active), None),
+                    queue_depth=self.jobs.qsize() + len(self.captures.pending),
+                    capture_workers=self.captures.workers,
+                    capture_threads=self.captures.threads,
+                    capture_running=len(self.captures.running),
+                    capture_pending=len(self.captures.pending),
+                )
             return health
 
     def prepare(self, value: dict[str, Any]) -> dict[str, Any]:
