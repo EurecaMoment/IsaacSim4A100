@@ -15,6 +15,14 @@ bash start-scenes.sh
 worker listens on loopback port 18324. Set
 `A100SIM_SCENE_URL=http://127.0.0.1:18324` in the gateway environment and start
 `serve-grpc.sh`. Supervise both processes with the deployment's service manager.
+LLVM captures share a Dr.Jit thread budget of `capture_workers × capture_threads`.
+A single capture can use up to `A100SIM_CAPTURE_BURST_THREADS` (default 32). Each
+job keeps its assignment until it finishes. The pool divides free threads among
+waiting snapshots and reserves a minimum for every unoccupied worker slot.
+The health endpoint reports the budget, peak, guaranteed minimum, and current
+allocation. Each job receipt records its assigned `capture_threads`. With 16
+slots and 8 threads per slot, the budget is 128 and the late-arrival minimum is 6.
+
 The scene worker needs the same asset root and result directories as the gateway.
 
 Operations are discovered through `GetCapabilities` and submitted with

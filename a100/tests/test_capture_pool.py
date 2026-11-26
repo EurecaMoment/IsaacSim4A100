@@ -1,5 +1,6 @@
 """Exercise FIFO snapshot isolation, bounded admission and durable worker failure."""
 import json
+import os
 import queue
 import tempfile
 import threading
@@ -69,11 +70,61 @@ class CapturePoolTests(unittest.TestCase):
         self.assertEqual(self.state.health()["active_jobs"], [])
         self.assertFalse(list(self.home.glob(".capture-*")))
 
+    def configure_llvm_pool(self):
+        self.state.jobs.maxsize = 64
+        with patch("a100sim.scenes.capture_pool.resource_budget", return_value=(16, 8)), patch.dict(
+            os.environ, {"A100SIM_RENDER_VARIANT": "llvm_ad_rgb", "A100SIM_CAPTURE_BURST_THREADS": "32"}
+        ):
+            self.state.captures = CapturePool(self.state)
+        self.addCleanup(self.state.captures.executor.shutdown)
+        return self.state.captures
+
+    def test_complete_waiting_batch_shares_budget_equally(self):
+        pool = self.configure_llvm_pool()
+        pool.pending.update(range(16))
+        for job_id in range(16):
+            pool.pending.remove(job_id)
+            self.assertEqual(pool.allocate(job_id), 8)
+        self.assertEqual(sum(pool.allocations.values()), 128)
+
+    def test_late_arrivals_start_once_and_release_all_allocations(self):
+        pool = self.configure_llvm_pool()
+        started, release = queue.Queue(), threading.Event()
+
+        def render(snapshot, directory, threads):
+            started.put((directory.name, threads))
+            if not release.wait(15):
+                raise TimeoutError("test capture timed out")
+            return {"threads": threads}
+
+        with patch("a100sim.scenes.capture_pool.render_snapshot", side_effect=render) as worker:
+            jobs, assignments = [], []
+            try:
+                for _ in range(16):
+                    job = self.capture()
+                    reported_id, count = started.get(timeout=3)
+                    self.assertEqual(reported_id, job)
+                    jobs.append(job)
+                    assignments.append(count)
+                self.assertEqual(assignments, [32, 12] + [6] * 14)
+                self.assertEqual(self.state.health()["capture_allocated_threads"], 128)
+                self.assertEqual(self.state.health()["capture_running"], 16)
+            finally:
+                release.set()
+            self.state.jobs.join()
+            self.assertEqual(worker.call_count, len(set(jobs)))
+            self.assertEqual([self.state.status(j)["capture_threads"] for j in jobs], assignments)
+            self.assertFalse(pool.allocations)
+            next_job = self.capture()
+            self.state.jobs.join()
+            self.assertEqual(self.state.status(next_job)["capture_threads"], 32)
+
     def test_worker_failure_returns_slot_and_keeps_session(self):
         with patch("a100sim.scenes.capture_pool.render_snapshot", side_effect=ValueError("bad camera")):
             failed = self.capture()
             self.state.jobs.join()
         self.assertEqual(self.state.status(failed)["error"], "bad camera")
         self.assertEqual(self.state.health()["failed"], 1)
+        self.assertFalse(self.state.captures.allocations)
         self.assertFalse(list(self.home.glob(".capture-*")))
         self.assertEqual((self.home / "stage.usdc").read_text(), "1")

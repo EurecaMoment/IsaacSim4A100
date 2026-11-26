@@ -109,6 +109,10 @@ class SceneQueue(JobQueue):
                     queue_depth=self.jobs.qsize() + len(self.captures.pending),
                     capture_workers=self.captures.workers,
                     capture_threads=self.captures.threads,
+                    capture_peak_threads=self.captures.peak_threads,
+                    capture_min_threads=self.captures.min_threads,
+                    capture_cpu_budget=self.captures.thread_budget,
+                    capture_allocated_threads=sum(self.captures.allocations.values()),
                     capture_running=len(self.captures.running),
                     capture_pending=len(self.captures.pending),
                 )

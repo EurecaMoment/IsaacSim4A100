@@ -45,9 +45,32 @@ class CapturePool:
     def __init__(self, state):
         self.state = state
         self.workers, self.threads = resource_budget()
+        self.thread_budget = self.workers * self.threads
+        peak = (
+            int(os.getenv("A100SIM_CAPTURE_BURST_THREADS", "32"))
+            if os.getenv("A100SIM_RENDER_VARIANT") == "llvm_ad_rgb"
+            else self.threads
+        )
+        self.peak_threads = min(max(self.threads, peak), self.thread_budget - self.workers + 1)
+        self.min_threads = (
+            (self.thread_budget - self.peak_threads) // (self.workers - 1) if self.workers > 1 else self.threads
+        )
+        self.allocations = {}
         self.executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="capture-supervisor")
         self.pending = set()
         self.running = set()
+
+    def allocate(self, job_id):
+        """Assign a fixed Dr.Jit pool for this snapshot, under the queue lock."""
+        free = self.thread_budget - sum(self.allocations.values())
+        unused_slots = self.workers - len(self.allocations) - 1
+        # Keep even a late arrival runnable. When a batch is already waiting,
+        # divide the free threads across its unstarted captures.
+        waiting = min(unused_slots + 1, len(self.pending) + 1)
+        share = free // waiting
+        threads = min(self.peak_threads, share, free - unused_slots * self.min_threads)
+        self.allocations[job_id] = threads
+        return threads
 
     def dispatch(self, job_id, payload):
         state = self.state
@@ -84,11 +107,14 @@ class CapturePool:
             with state.lock:
                 self.pending.discard(job_id)
                 self.running.add(job_id)
+                threads = self.allocate(job_id)
                 record = state.status(job_id)
                 now = time.time()
-                record.update(state="running", started_at=now, queue_seconds=now - record["queued_at"])
+                record.update(
+                    state="running", started_at=now, queue_seconds=now - record["queued_at"], capture_threads=threads
+                )
                 persist(state.output / job_id / "job.json", record)
-            result = render_snapshot(snapshot, state.output / job_id, self.threads)
+            result = render_snapshot(snapshot, state.output / job_id, threads)
         except Exception as exc:
             error = exc
         finally:
@@ -101,6 +127,7 @@ class CapturePool:
                 snapshot.unlink(missing_ok=True)
         finally:
             with state.changed:
+                self.allocations.pop(job_id, None)
                 now = time.time()
                 record = state.status(job_id)
                 if error is None:
