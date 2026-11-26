@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -257,7 +258,7 @@ def main():
     import drjit as dr
     from a100sim.scenes.preview_renderer import PreviewEngine
 
-    dr.set_thread_count(16)
+    dr.set_thread_count(min(32, len(os.sched_getaffinity(0))))
     server = PreviewServer(("127.0.0.1", args.port), PreviewEngine(), args.sessions, args.capacity, args.cache_size)
     with server:
         server.serve_forever()

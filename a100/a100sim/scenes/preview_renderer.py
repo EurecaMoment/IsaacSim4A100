@@ -90,7 +90,8 @@ class PreviewEngine:
         add_stage_geometry(scene, stage, "mesh", cache)
         sensors = {path: mi.load_dict(config) for path, config in cameras.items()}
         channels = LifoQueue()
-        for _ in range(4):
+        # Two independent films keep each scene responsive during bursts of new views.
+        for _ in range(2):
             channels.put(DirectPreview(mi.Properties()))
         return PreparedPreview(mi.load_dict(scene), sensors, size, channels, cameras)
 
