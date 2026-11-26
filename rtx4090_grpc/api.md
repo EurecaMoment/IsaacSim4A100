@@ -9,8 +9,13 @@
 
 1. [RPC 接口总览](#1-rpc-接口总览)
 2. [Health — 健康检查](#2-health--健康检查)
-3. [SubmitJob — 提交仿真任务](#3-submitjob--提交仿真任务)
-4. [GetJob — 查询任务 + 产物路径](#4-getjob--查询任务--产物路径)
+3. [SubmitJob — 提交仿真任务（幂等）](#3-submitjob--提交仿真任务幂等)
+4. [GetJob — 查询任务 + 产物清单](#4-getjob--查询任务--产物清单)
+5. [DownloadArtifact — 流式下载产物](#5-downloadartifact--流式下载产物)
+6. [AckJob — 落盘确认（不立即删除）](#6-ackjob--落盘确认不立即删除)
+7. [CancelJob — 取消任务](#7-canceljob--取消任务)
+8. [WatchJob — 服务端推送状态](#8-watchjob--服务端推送状态)
+9. [错误码汇总](#9-错误码汇总)
 
 ---
 
@@ -18,9 +23,13 @@
 
 | RPC | 请求类型 | 响应类型 | 说明 |
 |-----|---------|---------|------|
-| `Health` | `HealthRequest` | `HealthResponse` | 引擎就绪状态、GPU 信息、渲染能力 |
-| `SubmitJob` | `SimulateRequest` | `JobHandle` | 提交仿真任务，立即返回 32 位十六进制 job_id |
-| `GetJob` | `GetJobRequest` | `Job` | 轮询任务状态；成功时包含全部产物路径（每个路径指向的文件格式在 §4.3 详述）|
+| `Health` | `HealthRequest` | `HealthResponse` | 引擎就绪状态、GPU 信息、渲染能力、产物根与剩余空间 |
+| `SubmitJob` | `SubmitJobRequest` | `JobHandle` | 提交仿真任务，**带幂等键 `request_id`**，立即返回 32 位十六进制 job_id |
+| `GetJob` | `GetJobRequest` | `Job` | 轮询任务状态；成功时返回产物清单 `artifacts`（含 artifact_id / size / sha256，供下载）|
+| `DownloadArtifact` | `DownloadArtifactRequest` | 流 `DownloadChunk` | 流式下载单个产物，支持 `offset` 断点续传、并发上限 |
+| `AckJob` | `AckJobRequest` | `AckJobResponse` | 客户端落盘确认（仅打标记，不立即删产物）；所有产物统一由保留期到期回收 |
+| `CancelJob` | `GetJobRequest` | `Job` | 取消排队或运行中的任务（尽力中断；取消后已写出的产物仍可下载）|
+| `WatchJob` | `GetJobRequest` | 流 `Job` | 服务端推送状态与进度，终态后结束（可选；GetJob 轮询始终可用）|
 
 ---
 
@@ -54,16 +63,35 @@
 | 18 | `completed` | `uint32` | `12` | 自服务启动以来成功完成的任务数 |
 | 19 | `failed` | `uint32` | `0` | 自服务启动以来失败的任务数 |
 | 20 | `error` | `string` | — | 仅 `status="failed"` 时填充，引擎初始化错误信息 |
+| 21 | `api_version` | `string` | `"1.0.0"` | 服务端契约版本，客户端启动时断言兼容 |
+| 22 | `artifacts_root` | `string` | `"/mnt/data/.../state/jobs"` | 产物根目录（诊断用，不参与路径拼接）|
+| 23 | `artifacts_free_bytes` | `int64` | `21474836480` | 产物所在磁盘剩余字节；低于水位时 SubmitJob 拒绝新任务 |
+| 24 | `retention_seconds` | `int32` | `604800` | 产物保留期（秒）：任务结束后（无论是否 Ack）到期自动清理。对应 `.env` 的 `GRPC_RETENTION_SECONDS` |
 
 ---
 
-## 3. SubmitJob — 提交仿真任务
+## 3. SubmitJob — 提交仿真任务（幂等）
+
+### 3.0 外层包装：`SubmitJobRequest`
+
+| # | 字段名 | 类型 | 示例 | 字段含义说明 |
+|---|--------|------|------|-------------|
+| 1 | `request_id` | `string` | `"c1c65002..."`（32 位 hex） | **幂等键，必填**。客户端生成，建议 32 位小写十六进制（UUID4 即可）。同一 `request_id` 在服务端生命周期内唯一 |
+| 2 | `simulation` | `SimulateRequest` | 见 §3.1 | 仿真参数（原 SubmitJob 的请求体）|
+
+**幂等语义**：
+- 同 `request_id` + **同参数** → 返回原任务的 `JobHandle`（状态可能已是 `succeeded`），不会重复入队
+- 同 `request_id` + **不同参数** → `ALREADY_EXISTS`
+- `request_id` 为空 → `INVALID_ARGUMENT`
+- `request_id` 索引随 `job.json` 落盘，服务重启后仍可识别（参数比较基于 `simulation` 的归一化 JSON 摘要）
+
+**错误码**：`INVALID_ARGUMENT`（空 request_id / 非法 shape / 越界参数）、`ALREADY_EXISTS`（同键异参）、`RESOURCE_EXHAUSTED`（队列满 / 磁盘低于水位）、`UNAVAILABLE`（引擎未就绪）。
 
 ### 3.1 Request：`SimulateRequest`
 
 | # | 字段名 | 类型 | 示例 | 字段含义说明 |
 |---|--------|------|------|-------------|
-| 1 | `bodies` | `repeated BodySpec` | 见 §3.1.1 | 刚体列表。**留空**时上游自动生成 64 个默认立方体 |
+| 1 | `bodies` | `repeated BodySpec` | 见 §3.1.1 | 刚体列表。**留空**时上游自动生成 64 个默认立方体（动态，mass=1.0） |
 | 2 | `steps` | `uint32` | `120` | 物理仿真步数；范围 1–1200；缺省 240 |
 | 3 | `dt` | `double` | `0.008333` | 每步物理时长（秒）；范围 0.0001–0.02。1/120 ≈ 0.008333 即 120Hz；缺省 1/120 |
 | 4 | `gravity` | `double` | `9.81` | 重力加速度（m/s²）；范围 0–100；缺省 9.81 |
@@ -81,9 +109,19 @@
 | 4 | `orientation_xyzw` | `QuatXYZW` | `{"x":0,"y":0,"z":0,"w":1}` | 姿态四元数，xyzw 顺序；默认 `(0,0,0,1)` 无旋转 |
 | 5 | `size` | `Vec3` | `{"x":0.2,"y":0.2,"z":0.2}` | **仅 cube 必须提供**。三轴尺寸，单位米 |
 | 6 | `radius` | `double` | `0.13` | **仅 sphere 必须提供**。半径，单位米 |
-| 7 | `mass` | `double` | `1.0` | 质量（kg）；缺省 1.0 |
+| 7 | `mass` | `double` | `1.0` | 质量（kg），范围 `0.0001–100000`。**缺省或显式 `mass=0` 表示静态/运动学刚体**：不受重力、不响应接触冲量，`Job.bodies[].velocity` 恒为 0，位姿保持不变。显式正数则创建动态刚体 |
 | 8 | `color` | `Vec3` | `{"x":0.15,"y":0.4,"z":0.8}` | 显示颜色 RGB，范围 0–1 |
 | 9 | `asset` | `string` | `"/abs/path/to/mesh_dir"` | **仅 mesh**。目录绝对路径，需包含 `mesh.npz` |
+
+**静态体与动态体**
+
+| 输入 | 创建方式 | 行为 |
+|---|---|---|
+| `mass` 省略 | `RigidBodyAPI` + `KinematicEnabled=true`（不写 `MassAPI`） | 不受重力、不响应接触冲量；可与动态体碰撞并推开对方；位姿保持不变；`Job.bodies[].velocity` 恒为 `[0,0,0,0,0,0]` |
+| `mass=0` | 同上（作为静态体的等价写法，不会报错） | 同上 |
+| `mass>0` | `RigidBodyAPI` + `MassAPI(mass)` | 正常动态刚体，受重力与碰撞影响 |
+
+> 说明：`mass` 的合法正数范围是 `0.0001–100000`；负数、0 与 0.0001 之间的值仍返回 `INVALID_ARGUMENT`。静态体同样占用 `rigid_bodies` 计数与 `Job.bodies` 条目，只是速度为 0。
 
 #### 3.1.2 `RenderSpec` — 相机 / 灯光 / 渲染
 
@@ -162,7 +200,7 @@
 
 ---
 
-## 4. GetJob — 查询任务 + 产物路径
+## 4. GetJob — 查询任务 + 产物清单
 
 ### 4.1 Request：`GetJobRequest`
 
@@ -195,8 +233,23 @@
 | 19 | `physics_seconds` | `double` | `5.8` | 物理 step + 逐帧渲染总耗时 |
 | 20 | `collision` | `string` | `"PhysX primitives; convexHull for dynamic mesh"` | 碰撞体策略说明 |
 | 21 | `bodies` | `repeated BodyState` | 见 §4.2.1 | 尾帧每个刚体的物理状态 |
-| 22 | `artifacts` | `Artifacts` | 见 §4.2.2 | **全部产物的服务端绝对路径**（每个路径指向的文件格式在 §4.3 详述）|
+| 22 | `outputs` | `Artifacts` | 见 §4.2.2 | **遗留字段**：全部产物的服务端**绝对路径**（原 `artifacts`，已重命名为 `outputs` 以避让新清单；新代码请用 `artifacts` 清单 + DownloadArtifact）|
 | 23 | `render` | `RenderInfo` | 见 §4.2.3 | 尾帧渲染元信息（非路径，是数值 + 路径混合）|
+| 24 | `artifacts` | `repeated Artifact` | 见 §4.2.4 | **产物清单（新）**：每个产物的 `artifact_id` / `name` / `relative_path` / `size_bytes` / `sha256` / `media_type`，供 `DownloadArtifact` 拉取 |
+| 25 | `phase` | `string` | `"simulating"` | 当前阶段：`queued` / `loading_scene` / `simulating` / `rendering` / `writing_artifacts` / 终态 |
+| 26 | `frames_done` | `uint32` | `40` | 已完成采集的帧数（capture 模式）；运行中实时更新 |
+| 27 | `frames_total` | `uint32` | `120` | 计划采集的总帧数（capture 模式）|
+
+#### 4.2.4 `Artifact` — 单个产物清单条目
+
+| # | 字段名 | 类型 | 示例 | 字段含义说明 |
+|---|--------|------|------|-------------|
+| 1 | `artifact_id` | `string` | `"a1b2c3d4e5f60718"` | 任务内稳定唯一 id，由 `relative_path` 派生；传给 `DownloadArtifact.artifact_id` |
+| 2 | `name` | `string` | `"render.png"` | 文件名 |
+| 3 | `relative_path` | `string` | `"<job_id>/frames/frame_000040/render.png"` | 相对服务端 `artifacts_root` 的路径 |
+| 4 | `size_bytes` | `int64` | `3145728` | 文件字节数；`DownloadArtifact` 的 `offset` 必须 ≤ 此值 |
+| 5 | `sha256` | `string` | `"e3b0c442..."`（64 位 hex） | 文件内容 sha256，客户端下载后校验完整性 |
+| 6 | `media_type` | `string` | `"image/png"` | MIME 类型：`.png`→image/png，`.npy`→application/x-npy，`.npz`→application/x-npz，`.json`→application/json，`.usdc`→model/vnd.usdc |
 
 #### 4.2.1 `BodyState` — 单个刚体尾帧状态
 
@@ -205,7 +258,7 @@
 | 1 | `id` | `string` | `"blue-cube"` | 与请求中的 `BodySpec.id` 一致 |
 | 2 | `prim_path` | `string` | `"/World/Bodies/B0000"` | USD Stage 中对应的 prim 路径 |
 | 3 | `pose_xyzw` | `repeated double (7)` | `[-0.246, 0.005, 0.100, 0, 0, 0, 1.0]` | **7 维数组**：`[x, y, z, qx, qy, qz, qw]` |
-| 4 | `velocity` | `repeated double (6)` | `[5e-5, -3e-5, -1e-4, 8e-4, 1e-4, -2e-6]` | **6 维数组**：`[vx, vy, vz, ωx, ωy, ωz]` |
+| 4 | `velocity` | `repeated double (6)` | `[5e-5, -3e-5, -1e-4, 8e-4, 1e-4, -2e-6]` | **6 维数组**：`[vx, vy, vz, ωx, ωy, ωz]`。静态/运动学刚体（`BodySpec.mass` 省略或为 0）恒为全 0 |
 
 #### 4.2.2 `Artifacts` — 全部产物文件路径
 
@@ -246,11 +299,11 @@
 | 5 | `requested_spp` | `uint32` | `32` | 请求的子帧数 |
 | 6 | `rt_subframes` | `uint32` | `32` | 实际使用的 Hydra 子帧数 |
 | 7 | `sampling` | `string` | `"RTX real-time subframes; not Mitsuba path-tracing spp"` | 采样模式说明 |
-| 8 | `image` | `string` | 同 artifacts.image | 尾帧 RGB 路径（重复返回，方便直接访问）|
-| 9 | `depth_m` | `string` | 同 artifacts.depth_m | 尾帧深度路径 |
+| 8 | `image` | `string` | 同 outputs.image | 尾帧 RGB 路径（重复返回，方便直接访问）|
+| 9 | `depth_m` | `string` | 同 outputs.depth_m | 尾帧深度路径 |
 | 10 | `depth_convention` | `string` | `"distance_to_image_plane in stage meters; background may be infinity"` | 深度值语义说明 |
-| 11 | `semantic_ids` | `string` | 同 artifacts.semantic_ids | 尾帧语义分割路径 |
-| 12 | `semantic_labels` | `string` | 同 artifacts.semantic_labels | 语义标签表路径 |
+| 11 | `semantic_ids` | `string` | 同 outputs.semantic_ids | 尾帧语义分割路径 |
+| 12 | `semantic_labels` | `string` | 同 outputs.semantic_labels | 语义标签表路径 |
 | 13 | `rgb_mean` | `double` | `98.75` | 尾帧 render.png 的全局像素均值（0–255）|
 | 14 | `seconds` | `double` | `1.476` | 尾帧 render 的 wall-clock 耗时（秒）|
 
@@ -523,58 +576,172 @@ state/jobs/<job_id>/                          ← 一个仿真任务
 
 ---
 
+## 5. DownloadArtifact — 流式下载产物
+
+### 5.1 Request：`DownloadArtifactRequest`
+
+| # | 字段名 | 类型 | 示例 | 字段含义说明 |
+|---|--------|------|------|-------------|
+| 1 | `job_id` | `string` | `"c1c6..."` | 32 位小写十六进制 |
+| 2 | `artifact_id` | `string` | `"a1b2c3..."` | 来自 `GetJob` 返回的 `Job.artifacts[].artifact_id` |
+| 3 | `offset` | `int64` | `0` | 起始字节偏移；`0` 从头开始，`>0` 断点续传。必须 ≤ 产物 `size_bytes` |
+| 4 | `chunk_bytes` | `uint32` | `0` | 期望块大小；`0` 用服务端默认（1 MiB），上限 4 MiB |
+
+### 5.2 响应流：`DownloadChunk`
+
+| # | 字段名 | 类型 | 说明 |
+|---|--------|------|------|
+| 1 | `offset` | `int64` | 本块数据在文件中的起始偏移 |
+| 2 | `data` | `bytes` | 文件内容块 |
+
+### 5.3 行为与错误码
+
+- 任务状态必须为 `succeeded`（或取消后的 `interrupted`，已写出的产物仍可下载），否则 `FAILED_PRECONDITION`
+- 产物已被保留期清理 → `NOT_FOUND`（details 含 `artifacts_released`）
+- `artifact_id` 不属于该任务或任务不存在 → `NOT_FOUND`
+- `offset > size_bytes` → `OUT_OF_RANGE`；`offset == size_bytes` → 空流（正常结束）
+- 单任务并发下载流数超过上限（默认 8）→ `RESOURCE_EXHAUSTED`
+- 客户端应把各块按 `offset` 拼接，并用 `Job.artifacts[].sha256` 校验整体完整性后再 `AckJob`
+
+---
+
+## 6. AckJob — 落盘确认（不立即删除）
+
+### 6.1 Request：`AckJobRequest`
+
+| # | 字段名 | 类型 | 示例 | 字段含义说明 |
+|---|--------|------|------|-------------|
+| 1 | `job_id` | `string` | `"c1c6..."` | 32 位小写十六进制 |
+
+### 6.2 Response：`AckJobResponse`
+
+| # | 字段名 | 类型 | 示例 | 字段含义说明 |
+|---|--------|------|------|-------------|
+| 1 | `released` | `bool` | `false` | **始终为 false**（本版 Ack 不立即释放产物；保留期到期由后台线程统一清理）。保留该字段供未来恢复"Ack 立即删"语义时使用 |
+| 2 | `freed_bytes` | `int64` | `0` | **始终为 0**（本版 Ack 不立即释放）。保留该字段供未来恢复"Ack 立即删"语义时使用 |
+
+### 6.3 行为
+
+- Ack 的**唯一作用**是在 `job.json` 上标记 `acked=True`，表示客户端已完成校验落盘、消费方已确认。**不触发任何磁盘删除**
+- 产物的唯一回收路径是**保留期清理**（`Health.retention_seconds`，默认 7 天）。后台守护线程每 60s 扫描一次，只要任务已结束且 `finished_at` 距今超过保留期，**无论是否 Ack**，一律清理产物目录
+- Ack 后产物仍完整保留、`DownloadArtifact` 仍可正常下载，直到保留期到期
+- 重复调用幂等：多次 Ack 不会重复标记、不会报错
+- 任务不存在 → `NOT_FOUND`
+- **磁盘水位保护独立工作**：即使所有任务都 Ack 了，但磁盘剩余低于 `GRPC_MIN_FREE_BYTES`，新 SubmitJob 仍会被拒绝
+
+### 6.4 回收模型总结
+
+| 路径 | 触发条件 | 执行时机 | 覆盖范围 |
+|---|---|---|---|
+| **保留期清理（唯一）** | 任务已结束 + `finished_at` 距今 > `retention_seconds` | 后台线程每 60s 扫描 | 所有到期任务，**不管 acked=True 还是 False** |
+| 主动 Ack | 客户端显式调用 | 仅标记，不删文件 | — |
+
+> **历史说明**：旧版 Ack 会立即删除产物并回收磁盘（返回 `released=true`、`freed_bytes>0`）。2026-11-25 起改为"统一由保留期清理"模型，Ack 仅保留确认语义。如需恢复旧行为，可在 `job_manager.py` 的 `ack()` 里加回 `_delete_artifacts` 调用，并在 `_sweep_retention()` 里跳过 `acked=True` 的任务。
+
+---
+
+## 7. CancelJob — 取消任务
+
+### 7.1 Request / Response
+
+请求复用 `GetJobRequest`（仅需 `job_id`）；响应为 `Job`（返回取消后的实际状态）。
+
+### 7.2 行为
+
+- `queued`：立即从队列移除，状态置 `interrupted`，不会开始执行
+- `running`：尽力中断（逐帧循环每帧检查取消标志），已写出的帧产物保留，状态置 `interrupted`，仍可下载已写出产物
+- 终态（`succeeded` / `failed` / `interrupted`）：幂等返回当前状态
+- 任务不存在 → `NOT_FOUND`
+
+---
+
+## 8. WatchJob — 服务端推送状态
+
+> 可选能力（P2）。`GetJob` 轮询始终可用；`WatchJob` 用于减少轮询开销、更快获得进度更新。
+
+### 8.1 Request / 响应流
+
+请求复用 `GetJobRequest`；服务端推送 `Job` 流。
+
+### 8.2 行为
+
+- 首次立即推送一次当前状态，之后状态 / `phase` / `frames_done` / `frames_total` 变化时推送
+- 任务进入终态（`succeeded` / `failed` / `interrupted`）后推送最终状态并结束流
+- 客户端断开（`context.cancel`）即停止推送，不影响任务执行
+- 任务不存在 → 首个消息前 `NOT_FOUND`
+
+---
+
+## 9. 错误码汇总
+
+| 状态码 | 触发场景 |
+|--------|---------|
+| `INVALID_ARGUMENT` | job_id 非 32 位 hex；request_id 为空；非法 shape / 越界参数 |
+| `NOT_FOUND` | job_id 不存在；artifact_id 不属于任务；产物已被保留期清理（`artifacts_released`）|
+| `ALREADY_EXISTS` | 同 request_id 但参数不同 |
+| `FAILED_PRECONDITION` | 任务尚未 succeeded 就尝试下载 |
+| `OUT_OF_RANGE` | DownloadArtifact 的 offset 超过文件大小 |
+| `RESOURCE_EXHAUSTED` | 队列满；磁盘低于水位；单任务下载并发超上限 |
+| `UNAVAILABLE` | 引擎未就绪（initializing / failed）|
+| `INTERNAL` | 未预期的服务端错误 |
+
+---
+
 ## 附录 A：Python gRPC 完整调用链
 
 ```python
-import grpc, sys, time
+import grpc, sys, time, hashlib, uuid
 sys.path.insert(0, "generated")
 from proto.isaacsim_rpc.v1 import simulation_pb2, simulation_pb2_grpc
 
 ch = grpc.insecure_channel("127.0.0.1:18500")
-stub = simulation_pb2_grpc.SimulationStub(ch)
+stub = simulation_pb2_grpc.SimulationServiceStub(ch)
 
-# 1. 健康检查
+# 1. 健康检查 + 契约版本断言
 h = stub.Health(simulation_pb2.HealthRequest())
-assert h.status == "ready"
-print(f"GPU={h.physical_gpu}  renderer={h.renderer}  annotators={h.annotators}")
+assert h.status == "ready" and h.api_version.startswith("1.")
+print(f"GPU={h.physical_gpu}  renderer={h.renderer}  free={h.artifacts_free_bytes}")
 
-# 2. 提交任务（capture=every 20，自动逐帧渲染）
-req = simulation_pb2.SimulateRequest(
+# 2. 构造仿真参数（capture=every 20，自动逐帧渲染）
+sim = simulation_pb2.SimulateRequest(
     steps=120, dt=1.0/120, gravity=9.81, ground=True,
     bodies=[
-        simulation_pb2.BodySpec(
-            id="blue-cube", shape="cube",
+        simulation_pb2.BodySpec(id="blue-cube", shape="cube",
             position=simulation_pb2.Vec3(x=-0.25, y=0.0, z=1.2),
-            orientation_xyzw=simulation_pb2.QuatXYZW(x=0,y=0,z=0,w=1),
-            size=simulation_pb2.Vec3(x=0.2, y=0.2, z=0.2),
-            mass=1.0, color=simulation_pb2.Vec3(x=0.15,y=0.4,z=0.8),
-        ),
-        simulation_pb2.BodySpec(
-            id="red-sphere", shape="sphere",
+            size=simulation_pb2.Vec3(x=0.2, y=0.2, z=0.2), mass=1.0,
+            color=simulation_pb2.Vec3(x=0.15,y=0.4,z=0.8)),
+        simulation_pb2.BodySpec(id="red-sphere", shape="sphere",
             position=simulation_pb2.Vec3(x=0.25, y=0.0, z=0.8),
-            radius=0.13, mass=1.0,
-            color=simulation_pb2.Vec3(x=0.8, y=0.2, z=0.15),
-        ),
+            radius=0.13, mass=1.0, color=simulation_pb2.Vec3(x=0.8,y=0.2,z=0.15)),
     ],
-    capture=simulation_pb2.CaptureSpec(every=20),  # capture 存在 = 强制逐帧渲染
+    capture=simulation_pb2.CaptureSpec(every=20),
 )
-handle = stub.SubmitJob(req)
+# 3. 带幂等键提交
+handle = stub.SubmitJob(simulation_pb2.SubmitJobRequest(request_id=uuid.uuid4().hex, simulation=sim))
 job_id = handle.id
 
-# 3. 轮询任务
+# 4. 轮询（或改用 WatchJob 推送）
+job = None
 for _ in range(600):
     job = stub.GetJob(simulation_pb2.GetJobRequest(job_id=job_id))
     if job.state == "running":
+        print(f"  {job.phase} {job.frames_done}/{job.frames_total}")
         time.sleep(0.5); continue
     break
 
-# 4. 读取产物路径
+# 5. 拿产物清单并下载尾帧 render.png，校验 sha256
 assert job.state == "succeeded", job.error
-artifacts = job.artifacts
-print(f"尾帧: {artifacts.image}")
-print(f"逐帧数: {len(artifacts.frames)}")
-for f in artifacts.frames:
-    print(f"  frame={f.frame}: png={f.image} depth={f.depth_m} sem={f.semantic_ids}")
+render = next(a for a in job.artifacts if a.name == "render.png")
+hasher = hashlib.sha256()
+with open("render.png", "wb") as out:
+    for chunk in stub.DownloadArtifact(simulation_pb2.DownloadArtifactRequest(
+            job_id=job_id, artifact_id=render.artifact_id, offset=0, chunk_bytes=0)):
+        out.write(chunk.data); hasher.update(chunk.data)
+assert hasher.hexdigest() == render.sha256, "校验失败"
+
+# 6. 全部落盘校验后，标记 Ack 确认（仅标记，不删文件；保留期到期后台自动清理）
+ack = stub.AckJob(simulation_pb2.AckJobRequest(job_id=job_id))
+print(f"Ack 确认 released={ack.released} freed_bytes={ack.freed_bytes}（新语义均为 false/0）")
 ```
 
 ## 附录 B：CLI 快捷命令
@@ -585,14 +752,26 @@ cd /mnt/data/zhouwei/IsaacSim4A100/rtx4090_grpc
 # 健康检查
 .venv/bin/python -m client.cli health
 
-# 提交（capture=every 20，自动逐帧渲染）
-.venv/bin/python -m client.cli run --scene cube --capture-every 20
+# 提交并等待（capture=every 20，自动逐帧渲染）；--request-id 缺省自动生成
+.venv/bin/python -m client.cli run --scene cube --capture-every 20 --request-id <32hex>
 
 # 指定帧号
 .venv/bin/python -m client.cli run --scene cube --capture-frames 10,50,120
 
-# 查询
+# 查询（含产物清单 artifacts、phase、frames_done/frames_total）
 .venv/bin/python -m client.cli status --job-id <JOB_ID>
+
+# 列出产物清单
+.venv/bin/python -m client.cli list --job-id <JOB_ID>
+
+# 下载单个产物（按 artifact_id / name / relative_path），自动校验 sha256
+.venv/bin/python -m client.cli download --job-id <JOB_ID> render.png --out-dir ./out
+
+# 客户端校验落盘后，标记 Ack 确认（仅标记，不删文件；保留期到期后台自动清理）
+.venv/bin/python -m client.cli ack --job-id <JOB_ID>
+
+# 取消排队 / 运行中的任务
+.venv/bin/python -m client.cli cancel --job-id <JOB_ID>
 
 # 停服务
 bash shutdown.sh

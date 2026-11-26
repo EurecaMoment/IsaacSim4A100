@@ -2,30 +2,38 @@ syntax = "proto3";
 
 package isaacsim_rpc.v1;
 
-// ============================================================================
-// Isaac Sim RTX 4090 gRPC 门面服务
+// Isaac Sim RTX gRPC facade used by BenchForge.
 //
-// 一对一封装现有 HTTP 服务（默认 http://127.0.0.1:18409）的三个接口：
-//   GET  /health          -> SimulationService.Health
-//   POST /simulate        -> SimulationService.SubmitJob
-//   GET  /jobs/<job_id>   -> SimulationService.GetJob
-//
-// 字段语义与 HTTP JSON 保持一致；请求中未设置的字段由上游服务套用默认值。
-// ============================================================================
+// The service owns simulation and rendering on the remote machine. BenchForge
+// submits a SimulateRequest, polls GetJob, downloads artifacts over the SSH
+// tunnel, verifies size/sha256 locally and finally calls AckJob so the service
+// can reclaim disk space.
 
 service SimulationService {
-  // 服务健康检查与运行时元信息
+  // Service health and runtime metadata.
   rpc Health(HealthRequest) returns (HealthResponse);
 
-  // 提交物理仿真 + 渲染任务，立即返回 job 句柄
-  rpc SubmitJob(SimulateRequest) returns (JobHandle);
+  // Idempotent submission: the same request_id and payload return the original job.
+  rpc SubmitJob(SubmitJobRequest) returns (JobHandle);
 
-  // 查询任务状态；成功时同时返回产物路径与渲染元信息
+  // Job state, progress and the complete artifact manifest once succeeded.
   rpc GetJob(GetJobRequest) returns (Job);
+
+  // Stream one artifact, resumable from any byte offset.
+  rpc DownloadArtifact(DownloadArtifactRequest) returns (stream DownloadChunk);
+
+  // Confirm that every artifact was verified locally; the service may reclaim it.
+  rpc AckJob(AckJobRequest) returns (AckJobResponse);
+
+  // Cancel a queued or running job; terminal jobs are returned unchanged.
+  rpc CancelJob(GetJobRequest) returns (Job);
+
+  // Optional server push. Clients keep GetJob polling as the fallback.
+  rpc WatchJob(GetJobRequest) returns (stream Job);
 }
 
 // ---------------------------------------------------------------------------
-// 基础类型
+// Basic types
 // ---------------------------------------------------------------------------
 
 message Vec3 {
@@ -42,35 +50,36 @@ message QuatXYZW {
 }
 
 // ---------------------------------------------------------------------------
-// 场景描述
+// Scene description
 // ---------------------------------------------------------------------------
 
 message BodySpec {
-  // 唯一标识，会作为语义分割标签名；留空则由服务端按索引生成
+  // Unique within the request; also used as the semantic label.
   string id = 1;
 
   // cube | sphere | mesh
   string shape = 2;
 
-  // 世界坐标，单位米
+  // World position in meters.
   Vec3 position = 3;
 
-  // 姿态四元数，xyzw 顺序
+  // World orientation, xyzw order.
   QuatXYZW orientation_xyzw = 4;
 
-  // 仅 cube：三轴尺寸（米）
+  // cube only: axis sizes in meters.
   Vec3 size = 5;
 
-  // 仅 sphere：半径（米）
+  // sphere only: radius in meters.
   optional double radius = 6;
 
-  // 质量（千克）
+  // Mass in kilograms. Omitted or 0 means a static/kinematic body
+  // (no gravity, no contact impulses, velocity always 0).
   optional double mass = 7;
 
-  // 显示颜色，RGB，0~1
+  // Display color, RGB, 0..1.
   Vec3 color = 8;
 
-  // 仅 mesh：服务端绝对路径，目录内需包含 mesh.npz
+  // mesh only: server-side absolute directory containing mesh.npz.
   optional string asset = 9;
 }
 
@@ -91,13 +100,13 @@ message LightingSpec {
 }
 
 message RenderSpec {
-  // RTX 后端只支持 mesh
+  // RTX backend only supports mesh.
   optional string kind = 1;
 
-  // 图像边长像素，上游允许 64~1024
+  // Image edge in pixels; the upstream service allows 64..1024.
   optional uint32 size = 2;
 
-  // RTX 下表示子帧数，上游允许 1~256
+  // RTX subframes; the upstream service allows 1..256.
   optional uint32 spp = 3;
 
   optional uint32 seed = 4;
@@ -110,17 +119,18 @@ message RenderSpec {
 }
 
 message CaptureSpec {
-  // 每 N 帧记录一次（1~steps）；与 frames 同时给出时取并集
+  // Record every N steps (1..steps); unioned with frames when both are set.
   optional uint32 every = 1;
 
-  // 指定帧号列表（1~steps，自动去重排序，最多 1200 项）
+  // Explicit step numbers (1..steps), deduplicated and sorted, at most 1200.
   repeated uint32 frames = 2;
-  // 注：CaptureSpec 存在即强制逐帧渲染（RGB + depth + semantic + state），
-  // 每帧产物落到 frames/frame_XXXXXX/ 子目录；仅 RTX 后端支持。
+
+  // Presence forces per-step rendering (RGB + depth + semantic + state).
+  // Frames are written under frames/frame_XXXXXX/ on the service.
 }
 
 message SimulateRequest {
-  // 留空表示使用上游默认场景（64 个立方体）
+  // Empty means the upstream default scene.
   repeated BodySpec bodies = 1;
 
   optional uint32 steps = 2;
@@ -129,13 +139,19 @@ message SimulateRequest {
   optional bool ground = 5;
   RenderSpec render = 6;
 
-  // 中间帧采样；缺省时只输出尾帧（state.npz）
+  // Intermediate frame sampling; without it only the final state.npz is written.
   CaptureSpec capture = 7;
 }
 
 // ---------------------------------------------------------------------------
-// 任务句柄与结果
+// Jobs and results
 // ---------------------------------------------------------------------------
+
+message SubmitJobRequest {
+  // Stable client identity (recommended 32+ hex characters).
+  string request_id = 1;
+  SimulateRequest simulation = 2;
+}
 
 message JobHandle {
   string id = 1;
@@ -144,7 +160,7 @@ message JobHandle {
 }
 
 message GetJobRequest {
-  // 32 位小写十六进制
+  // 32 lower-case hexadecimal characters.
   string job_id = 1;
 }
 
@@ -159,19 +175,20 @@ message BodyState {
   repeated double velocity = 4;
 }
 
-// 单帧状态快照（仿真过程中边模拟边落盘）
+// Per-frame state snapshot (written while the simulation runs).
 message FrameArtifact {
   uint32 frame = 1;
   string state_npz = 2;
 
-  // 以下仅在 capture.render=true 时填充
+  // Populated only when capture.render=true.
   string image = 3;
   string depth_m = 4;
   string semantic_ids = 5;
   string semantic_labels = 6;
 }
 
-// 产物位于服务端文件系统，返回绝对路径
+// Legacy absolute-path outputs. Kept for wire compatibility; BenchForge reads
+// the verified repeated Artifact manifest instead.
 message Artifacts {
   string state_npz = 1;
   string scene = 2;
@@ -180,8 +197,6 @@ message Artifacts {
   string depth_m = 5;
   string semantic_ids = 6;
   string semantic_labels = 7;
-
-  // 按帧采样的状态列表；未配置 capture 时为空
   repeated FrameArtifact frames = 8;
 }
 
@@ -202,6 +217,17 @@ message RenderInfo {
   double seconds = 14;
 }
 
+// One downloadable file. relative_path is relative to the service artifact
+// root; clients never see or construct absolute server paths from it.
+message Artifact {
+  string artifact_id = 1;
+  string name = 2;
+  string relative_path = 3;
+  uint64 size_bytes = 4;
+  string sha256 = 5;
+  string media_type = 6;
+}
+
 message Job {
   string id = 1;
 
@@ -215,7 +241,7 @@ message Job {
   double execution_seconds = 7;
   string error = 8;
 
-  // ---- 仿真结果（任务成功后填充）----
+  // ---- simulation result (filled on success) ----
   string isaac_sim = 9;
   string physics_device = 10;
   int32 physical_gpu = 11;
@@ -230,12 +256,46 @@ message Job {
   string collision = 20;
   repeated BodyState bodies = 21;
 
-  Artifacts artifacts = 22;
+  // Legacy absolute-path outputs. Superseded by artifacts below.
+  Artifacts outputs = 22;
   RenderInfo render = 23;
+
+  // Complete artifact manifest; only populated for succeeded jobs.
+  repeated Artifact artifacts = 24;
+
+  // queued | loading_scene | simulating | rendering | writing_artifacts
+  string phase = 25;
+  uint32 frames_done = 26;
+  uint32 frames_total = 27;
 }
 
 // ---------------------------------------------------------------------------
-// 健康检查
+// Download
+// ---------------------------------------------------------------------------
+
+message DownloadArtifactRequest {
+  string job_id = 1;
+  string artifact_id = 2;
+  uint64 offset = 3;
+  uint32 chunk_bytes = 4;
+}
+
+message DownloadChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+message AckJobRequest {
+  string job_id = 1;
+}
+
+message AckJobResponse {
+  bool released = 1;
+  uint64 freed_bytes = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Health
 // ---------------------------------------------------------------------------
 
 message HealthRequest {}
@@ -262,6 +322,12 @@ message HealthResponse {
   uint32 completed = 18;
   uint32 failed = 19;
 
-  // 仅在引擎初始化失败时出现（status=failed）
+  // Only set when status=failed.
   string error = 20;
+
+  // Contract version, artifact root (diagnostics only), free disk and retention.
+  string api_version = 21;
+  string artifacts_root = 22;
+  uint64 artifacts_free_bytes = 23;
+  uint32 retention_seconds = 24;
 }

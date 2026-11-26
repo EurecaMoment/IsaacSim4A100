@@ -19,12 +19,13 @@ import grpc
 
 from . import config, rpc
 from .engine import Engine
+from .job_manager import JobManager
 from .servicer import SimulationServicer
 
 MAX_MESSAGE = 32 * 1024 * 1024
 
 
-def build_server(settings: config.Settings, state) -> grpc.Server:
+def build_server(settings: config.Settings, manager: JobManager) -> grpc.Server:
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=settings.max_workers, thread_name_prefix="grpc"),
         options=(
@@ -32,7 +33,7 @@ def build_server(settings: config.Settings, state) -> grpc.Server:
             ("grpc.max_receive_message_length", MAX_MESSAGE),
         ),
     )
-    rpc.simulation_pb2_grpc.add_SimulationServiceServicer_to_server(SimulationServicer(state), server)
+    rpc.simulation_pb2_grpc.add_SimulationServiceServicer_to_server(SimulationServicer(manager), server)
     if settings.reflection:
         try:
             from grpc_reflection.v1alpha import reflection
@@ -83,7 +84,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"加载 Isaac Sim 引擎: {settings.isaac_sim_dir} (gpu={settings.isaac_gpu})", flush=True)
     engine = Engine(settings)
-    server = build_server(settings, engine.queue)
+    manager = JobManager(engine.queue, settings)
+    manager.start_retention(stop)
+    server = build_server(settings, manager)
     address = f"{settings.host}:{settings.port}"
     if server.add_insecure_port(address) == 0:
         print(f"ERROR: 无法绑定 {address}", file=sys.stderr)

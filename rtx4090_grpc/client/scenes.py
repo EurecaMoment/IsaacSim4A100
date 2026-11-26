@@ -131,6 +131,7 @@ def _cube() -> Any:
                     "shape": "cube",
                     "position": [-0.25, 0, 1.2],
                     "size": [0.2, 0.2, 0.2],
+                    "mass": 1.0,
                     "color": [0.15, 0.4, 0.8],
                 },
                 {
@@ -138,6 +139,7 @@ def _cube() -> Any:
                     "shape": "sphere",
                     "position": [0.25, 0, 0.8],
                     "radius": 0.13,
+                    "mass": 1.0,
                     "color": [0.8, 0.2, 0.15],
                 },
             ],
@@ -154,6 +156,7 @@ def _stack() -> Any:
             "shape": "cube",
             "position": [0, 0, 0.5 + i * 0.21],
             "size": [0.2, 0.2, 0.2],
+            "mass": 1.0,
             "color": [0.1 + i * 0.1, 0.3, 0.9 - i * 0.1],
         }
         for i in range(5)
@@ -170,6 +173,7 @@ def _sphere_rain() -> Any:
             "shape": "sphere",
             "position": [(i % 5 - 2) * 0.3, (i // 5 - 2) * 0.3, 2.0 + i * 0.05],
             "radius": 0.08,
+            "mass": 0.5,
             "color": [0.9, 0.6, 0.2],
         }
         for i in range(25)

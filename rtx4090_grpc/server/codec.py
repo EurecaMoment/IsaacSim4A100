@@ -153,6 +153,10 @@ def health_to_proto(record: dict[str, Any]) -> Any:
     )
     message.supported_shapes.extend(record.get("supported_shapes") or [])
     message.annotators.extend(record.get("annotators") or [])
+    message.api_version = str(record.get("api_version") or "")
+    message.artifacts_root = str(record.get("artifacts_root") or "")
+    message.artifacts_free_bytes = _to_int(record.get("artifacts_free_bytes"))
+    message.retention_seconds = _to_int(record.get("retention_seconds"))
     return message
 
 
@@ -249,6 +253,23 @@ def job_to_proto(record: dict[str, Any]) -> Any:
                 velocity=[float(v) for v in body.get("velocity") or []],
             )
         )
+    # 进度字段
+    message.phase = str(record.get("phase") or "")
+    message.frames_done = _to_int(record.get("frames_done"))
+    message.frames_total = _to_int(record.get("frames_total"))
+
+    # 产物清单（新契约的下载句柄）
+    for artifact in record.get("artifact_manifest") or []:
+        message.artifacts.append(pb.Artifact(
+            artifact_id=str(artifact.get("artifact_id", "")),
+            name=str(artifact.get("name", "")),
+            relative_path=str(artifact.get("relative_path", "")),
+            size_bytes=_to_int(artifact.get("size_bytes")),
+            sha256=str(artifact.get("sha256", "")),
+            media_type=str(artifact.get("media_type", "")),
+        ))
+
+    # 遗留的绝对路径产物（field 22，已更名为 outputs，供兼容）
     artifacts = _artifacts_to_proto(record)
     if any(
         (
@@ -261,7 +282,7 @@ def job_to_proto(record: dict[str, Any]) -> Any:
             artifacts.semantic_labels,
         )
     ):
-        message.artifacts.CopyFrom(artifacts)
+        message.outputs.CopyFrom(artifacts)
     if record.get("render"):
         message.render.CopyFrom(_render_info_to_proto(record["render"]))
     return message

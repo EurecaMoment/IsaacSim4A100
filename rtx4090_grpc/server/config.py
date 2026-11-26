@@ -53,10 +53,23 @@ class Settings:
     isaac_gpu: int = 0
     state_root: Path = ROOT / "state"
 
+    # 产物与下载
+    api_version: str = "1.0.0"            # 契约版本，Health 暴露给客户端断言
+    retention_seconds: int = 7 * 86400    # 产物保留期（无论是否 Ack），过期统一清理
+    max_download_streams: int = 8         # 单 job 并发下载流上限
+    download_chunk_bytes: int = 1024 * 1024   # 默认块大小（1 MiB）
+    download_chunk_max: int = 4 * 1024 * 1024 # 单块上限（4 MiB）
+    min_free_bytes: int = 2 * 1024**3     # 磁盘水位保护：低于该值拒绝新任务
+
     @property
     def output(self) -> Path:
         """产物根目录，任务在其下按 job_id 建子目录。"""
         return self.state_root / "jobs"
+
+    @property
+    def artifacts_root(self) -> Path:
+        """产物根目录（与 output 相同；Health 仅用于诊断，不参与路径拼接）。"""
+        return self.output
 
     @classmethod
     def load(cls, env_file: Path | None = DEFAULT_ENV_FILE) -> "Settings":
@@ -72,4 +85,10 @@ class Settings:
             isaac_sim_dir=Path(os.environ.get("ISAAC_SIM_DIR", str(defaults.isaac_sim_dir))),
             isaac_gpu=int(os.environ.get("ISAAC_GPU", str(defaults.isaac_gpu))),
             state_root=Path(os.environ.get("RTX4090_GRPC_STATE_ROOT", str(defaults.state_root))),
+            api_version=os.environ.get("GRPC_API_VERSION", defaults.api_version),
+            retention_seconds=int(os.environ.get("GRPC_RETENTION_SECONDS", str(defaults.retention_seconds))),
+            max_download_streams=int(os.environ.get("GRPC_MAX_DOWNLOAD_STREAMS", str(defaults.max_download_streams))),
+            download_chunk_bytes=int(os.environ.get("GRPC_DOWNLOAD_CHUNK_BYTES", str(defaults.download_chunk_bytes))),
+            download_chunk_max=int(os.environ.get("GRPC_DOWNLOAD_CHUNK_MAX", str(defaults.download_chunk_max))),
+            min_free_bytes=int(os.environ.get("GRPC_MIN_FREE_BYTES", str(defaults.min_free_bytes))),
         )

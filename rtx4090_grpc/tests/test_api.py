@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import grpc
@@ -129,12 +131,26 @@ def main() -> int:
 
         report.run("Health：能力与队列信息", check_capabilities)
 
+        def check_health_contract():
+            health = state["health"]
+            require(bool(health.api_version), "api_version 为空")
+            require(bool(health.artifacts_root), "artifacts_root 为空")
+            require(health.retention_seconds > 0, "retention_seconds 异常")
+            require(health.artifacts_free_bytes >= 0, "artifacts_free_bytes 异常")
+            return (f"api={health.api_version} root={health.artifacts_root} "
+                    f"free={health.artifacts_free_bytes} retention={health.retention_seconds}")
+
+        report.run("Health：契约版本与产物元信息", check_health_contract)
+
         def check_submit():
             request = scenes.load(args.scene)
             if args.capture_every:
                 request.capture.every = args.capture_every
             state["steps"] = request.steps
-            handle = stub.SubmitJob(request, timeout=30)
+            state["request_id"] = uuid.uuid4().hex
+            state["simulation"] = request
+            submit_req = pb.SubmitJobRequest(request_id=state["request_id"], simulation=request)
+            handle = stub.SubmitJob(submit_req, timeout=30)
             state["handle"] = handle
             require(len(handle.id) == 32, f"job_id 长度异常: {handle.id!r}")
             int(handle.id, 16)  # 必须是十六进制
@@ -144,6 +160,34 @@ def main() -> int:
 
         if not report.run("SubmitJob：提交任务并返回 job 句柄", check_submit):
             return report.summary()
+
+        def check_idempotent():
+            # 同 request_id + 同参数 → 幂等返回同一 job_id
+            submit_req = pb.SubmitJobRequest(
+                request_id=state["request_id"], simulation=state["simulation"])
+            handle2 = stub.SubmitJob(submit_req, timeout=30)
+            require(handle2.id == state["handle"].id,
+                    f"幂等命中应返回同一 job_id，期望 {state['handle'].id} 实际 {handle2.id}")
+            return f"幂等返回同一 job_id={handle2.id}"
+
+        report.run("SubmitJob：同 request_id 幂等返回", check_idempotent)
+
+        def check_idempotent_conflict():
+            different = pb.SimulateRequest(steps=999)
+            submit_req = pb.SubmitJobRequest(request_id=state["request_id"], simulation=different)
+            expect_code(lambda: stub.SubmitJob(submit_req, timeout=10),
+                        grpc.StatusCode.ALREADY_EXISTS)
+            return "ALREADY_EXISTS"
+
+        report.run("SubmitJob：同 request_id 不同参数 → ALREADY_EXISTS", check_idempotent_conflict)
+
+        def check_empty_request_id():
+            submit_req = pb.SubmitJobRequest(request_id="", simulation=state["simulation"])
+            expect_code(lambda: stub.SubmitJob(submit_req, timeout=10),
+                        grpc.StatusCode.INVALID_ARGUMENT)
+            return "INVALID_ARGUMENT"
+
+        report.run("SubmitJob：空 request_id → INVALID_ARGUMENT", check_empty_request_id)
 
         def check_immediate():
             job = stub.GetJob(pb.GetJobRequest(job_id=state["handle"].id), timeout=15)
@@ -197,13 +241,13 @@ def main() -> int:
         report.run("GetJob：渲染元信息完整", check_render)
 
         def check_artifacts():
-            artifacts = state["job"].artifacts
+            outputs = state["job"].outputs
             paths = {
-                "image": artifacts.image,
-                "depth_m": artifacts.depth_m,
-                "semantic_ids": artifacts.semantic_ids,
-                "scene": artifacts.scene,
-                "simulation_json": artifacts.simulation_json,
+                "image": outputs.image,
+                "depth_m": outputs.depth_m,
+                "semantic_ids": outputs.semantic_ids,
+                "scene": outputs.scene,
+                "simulation_json": outputs.simulation_json,
             }
             missing = [name for name, path in paths.items() if not path]
             require(not missing, f"缺少产物路径: {missing}")
@@ -213,8 +257,28 @@ def main() -> int:
 
         report.run("产物：路径有效且文件已落盘", check_artifacts)
 
+        def check_manifest():
+            job = state["job"]
+            require(len(job.artifacts) > 0, "产物清单为空")
+            by_rel = {a.relative_path: a for a in job.artifacts}
+            # 顶层产物必须在清单内
+            require(job.outputs.image, "缺少 outputs.image")
+            image_rel = f"{job.id}/render.png"
+            require(image_rel in by_rel, f"清单缺少 {image_rel}")
+            entry = by_rel[image_rel]
+            require(entry.size_bytes > 0, "size_bytes 缺失")
+            require(len(entry.sha256) == 64, "sha256 应为 64 位 hex")
+            require(entry.media_type == "image/png", f"media_type 异常: {entry.media_type}")
+            require(entry.artifact_id, "artifact_id 为空")
+            # artifact_id 在任务内唯一
+            ids = [a.artifact_id for a in job.artifacts]
+            require(len(ids) == len(set(ids)), "artifact_id 不唯一")
+            return f"{len(job.artifacts)} 个产物，首项 {ids[0]}"
+
+        report.run("GetJob：产物清单（artifact_id/size/sha256/media_type）", check_manifest)
+
         def check_frames():
-            frames = list(state["job"].artifacts.frames)
+            frames = list(state["job"].outputs.frames)
             require(bool(frames), "未返回按帧采样结果")
             require(all(Path(frame.state_npz).is_file() for frame in frames), "帧状态文件缺失")
             got = [frame.frame for frame in frames]
@@ -222,6 +286,11 @@ def main() -> int:
             if steps:
                 expected = sorted(set(range(args.capture_every, steps + 1, args.capture_every)) | {steps})
                 require(got == expected, f"帧号 {got} != 期望 {expected}")
+            # 帧产物也应出现在 manifest 中
+            by_rel = {a.relative_path for a in state["job"].artifacts}
+            for frame in frames:
+                rel = f"{state['job'].id}/frames/frame_{frame.frame:06d}/state.npz"
+                require(rel in by_rel, f"帧产物未在 manifest: {rel}")
             return f"{len(frames)} 帧：{got}"
 
         if args.capture_every:
@@ -248,10 +317,119 @@ def main() -> int:
         def bad_shape():
             bad = pb.SimulateRequest()
             bad.bodies.add(id="bad", shape="cone")
-            expect_code(lambda: stub.SubmitJob(bad, timeout=10), grpc.StatusCode.INVALID_ARGUMENT)
+            submit_req = pb.SubmitJobRequest(request_id=uuid.uuid4().hex, simulation=bad)
+            expect_code(lambda: stub.SubmitJob(submit_req, timeout=10),
+                        grpc.StatusCode.INVALID_ARGUMENT)
             return "INVALID_ARGUMENT"
 
         report.run("错误码：非法几何体类型", bad_shape)
+
+        def check_download():
+            job = state["job"]
+            # 选 outputs.image 对应的顶层 render.png（capture 场景下避免取到帧 render.png）
+            image_rel = f"{job.id}/render.png"
+            target = next((a for a in job.artifacts if a.relative_path == image_rel), None)
+            require(target is not None, f"manifest 中无顶层 {image_rel}")
+            hasher = hashlib.sha256()
+            total = 0
+            for chunk in stub.DownloadArtifact(
+                pb.DownloadArtifactRequest(job_id=job.id, artifact_id=target.artifact_id,
+                                           offset=0, chunk_bytes=0),
+                timeout=60,
+            ):
+                hasher.update(chunk.data)
+                total += len(chunk.data)
+            require(total == target.size_bytes,
+                    f"下载字节数 {total} != 清单 {target.size_bytes}")
+            require(hasher.hexdigest() == target.sha256,
+                    f"sha256 不一致：{hasher.hexdigest()} != {target.sha256}")
+            return f"下载 {target.relative_path} {total}B sha256 校验通过"
+
+        report.run("DownloadArtifact：下载并校验 sha256", check_download)
+
+        def check_download_resume():
+            job = state["job"]
+            # 同上：匹配 outputs.image 对应的顶层 render.png
+            image_rel = f"{job.id}/render.png"
+            target = next((a for a in job.artifacts if a.relative_path == image_rel), None)
+            require(target is not None, f"manifest 中无顶层 {image_rel}")
+            offset = max(1, target.size_bytes // 2)
+            collected = b""
+            for chunk in stub.DownloadArtifact(
+                pb.DownloadArtifactRequest(job_id=job.id, artifact_id=target.artifact_id,
+                                           offset=offset, chunk_bytes=0),
+                timeout=60,
+            ):
+                collected += chunk.data
+            # 用同一个 artifact 的 size_bytes 算 offset，用同一个文件比对
+            expected = Path(job.outputs.image).read_bytes()[offset:]
+            require(len(expected) == target.size_bytes - offset,
+                    f"磁盘文件大小与清单不一致：磁盘切片={len(expected)} 清单={target.size_bytes - offset}")
+            require(collected == expected, "续传内容与源文件切片不一致")
+            return f"offset={offset} 续传 {len(collected)}B 一致"
+
+        report.run("DownloadArtifact：offset 续传内容一致", check_download_resume)
+
+        def check_ack():
+            resp = stub.AckJob(pb.AckJobRequest(job_id=state["job"].id), timeout=30)
+            # 新语义：Ack 只标记 acked=True，不立即释放产物
+            require(resp.released is False, f"Ack 后 released 应为 false（新语义：不立即删），实际={resp.released}")
+            require(resp.freed_bytes == 0, f"freed_bytes 应为 0（等保留期清理），实际={resp.freed_bytes}")
+            # Ack 后产物仍在，下载仍可用
+            target = next(a for a in state["job"].artifacts if a.name == "render.png")
+            chunks = list(stub.DownloadArtifact(
+                pb.DownloadArtifactRequest(job_id=state["job"].id,
+                                           artifact_id=target.artifact_id), timeout=10))
+            total = sum(len(c.data) for c in chunks)
+            require(total > 0, f"Ack 后下载应仍可用，实际读到 0 字节")
+            return f"released={resp.released} freed={resp.freed_bytes}B，Ack 后产物仍可下载 {total}B"
+
+        report.run("AckJob：落盘确认标记，保留期内产物仍可下载", check_ack)
+
+        def check_static_body():
+            """BodySpec.mass 省略或为 0 → 静态/运动学刚体：不下落、velocity 恒为 0。"""
+            def submit(bodies):
+                req = pb.SubmitJobRequest(
+                    request_id=uuid.uuid4().hex,
+                    simulation=pb.SimulateRequest(
+                        bodies=bodies, steps=30, dt=1 / 120, gravity=9.81, ground=True))
+                jid = stub.SubmitJob(req, timeout=30).id
+                deadline = time.monotonic() + args.timeout
+                while time.monotonic() < deadline:
+                    job = stub.GetJob(pb.GetJobRequest(job_id=jid), timeout=30)
+                    if job.state not in {"queued", "running"}:
+                        return job
+                    time.sleep(args.interval)
+                raise AssertionError(f"静态体任务等待超时: {jid}")
+
+            def cube(body_id, mass=None):
+                body = pb.BodySpec(id=body_id, shape="cube",
+                                   position=pb.Vec3(x=0, y=0, z=1.0),
+                                   size=pb.Vec3(x=.2, y=.2, z=.2))
+                if mass is not None:
+                    body.mass = mass
+                return body
+
+            results = {}
+            for label, mass in (("省略", None), ("零", 0.0)):
+                job = submit([cube(f"static-{label}", mass)])
+                require(job.state == "succeeded", f"mass {label} 任务失败: {job.state} {job.error}")
+                body = job.bodies[0]
+                require(abs(body.pose_xyzw[2] - 1.0) < 1e-3,
+                        f"mass {label} 应保持 z=1.0，实际 {body.pose_xyzw[2]:.4f}")
+                require(all(abs(v) < 1e-6 for v in body.velocity),
+                        f"mass {label} velocity 应全 0，实际 {list(body.velocity)}")
+                results[label] = body.pose_xyzw[2]
+
+            # 对照：显式正质量应下落，确认静态语义不是全局失效
+            dynamic = submit([cube("dynamic", 1.0)])
+            require(dynamic.state == "succeeded", f"动态任务失败: {dynamic.state}")
+            require(dynamic.bodies[0].pose_xyzw[2] < 0.95,
+                    f"mass=1.0 应下落，实际 z={dynamic.bodies[0].pose_xyzw[2]:.4f}")
+            return (f"省略/零 mass 静止于 z={results['省略']:.3f}，mass=1.0 下落至 "
+                    f"z={dynamic.bodies[0].pose_xyzw[2]:.3f}")
+
+        report.run("BodySpec.mass：省略或 0 → 静态体（不下落、velocity=0）", check_static_body)
 
     return report.summary()
 

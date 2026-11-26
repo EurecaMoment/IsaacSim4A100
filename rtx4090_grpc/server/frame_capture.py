@@ -29,6 +29,70 @@ class RtxQueueWithFrameCapture(RtxQueue):
     """gRPC 引擎的任务队列：逐帧采集 + 逐帧渲染。"""
 
     # ------------------------------------------------------------------
+    # run_one：在不改动上游的前提下，接入取消 / 进度 / 产物清单收尾
+    # ------------------------------------------------------------------
+
+    def _manager(self):
+        return getattr(self, "manager", None)
+
+    def _progress(self, **kw) -> None:
+        """向 JobManager 上报进度（manager 未就绪时为空操作）。"""
+        mgr = self._manager()
+        if mgr is not None:
+            mgr.update_progress(getattr(self, "_job_id", "") or "", **kw)
+
+    def _is_cancelled(self) -> bool:
+        mgr = self._manager()
+        if mgr is None:
+            return False
+        return mgr.is_cancelled(getattr(self, "_job_id", "") or "")
+
+    def run_one(self, item) -> None:
+        job_id, payload = item
+        directory = self.output / job_id
+        mgr = self._manager()
+        if mgr is not None:
+            mgr._begin(job_id, payload)
+        started = time.time()
+        with self.lock:
+            record = self.status(job_id)
+            record.update(state="running", started_at=started,
+                          queue_seconds=started - record.get("queued_at", started))
+            if mgr is not None:
+                mgr._merge_progress(record, job_id)
+            persist(directory / "job.json", record)
+            self.active = job_id
+        try:
+            result = self.process(payload, directory)
+            cancelled = bool(result.pop("_cancelled", False))
+            record.update(result)
+            record.update(id=job_id, state="interrupted" if cancelled else "succeeded")
+            if not cancelled:
+                self.completed += 1
+        except Exception as exc:  # noqa: BLE001
+            record.update(id=job_id, state="failed", error=str(exc)[:1000])
+            self.failed += 1
+            print(f"JOB_FAILED {job_id}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            record.update(finished_at=time.time(),
+                          execution_seconds=time.time() - started)
+            if mgr is not None:
+                mgr._merge_progress(record, job_id)
+                # phase 兜底：内存里没有的话用 state
+                record["phase"] = record.get("phase") or record.get("state", "")
+                # 先算 manifest 写进 record，再 persist —— 避免客户端在两次写之间查询拿到空 manifest
+                if record.get("state") in ("succeeded", "interrupted") \
+                        and "artifact_manifest" not in record:
+                    record["artifact_manifest"] = mgr._compute_manifest(job_id)
+            with self.lock:
+                persist(directory / "job.json", record)
+                self.active = None
+            self.jobs.task_done()
+            if mgr is not None:
+                mgr._finalize(job_id)  # 幂等：manifest 已存在则跳过
+                mgr._end(job_id)
+
+    # ------------------------------------------------------------------
     # 0. 覆盖 prepare：上游不认识 capture 字段，这里补上
     # ------------------------------------------------------------------
 
@@ -36,7 +100,25 @@ class RtxQueueWithFrameCapture(RtxQueue):
         # 先把 capture 摘出来，让上游 prepare 能过 unknown 字段检查
         capture_value = value.get("capture")
         upstream_input = {k: v for k, v in value.items() if k != "capture"}
+
+        # mass 语义预处理（proto 约定：省略即静态体）：
+        # 上游把省略的 mass 默认成 1.0 且拒绝 0，这里在调用上游前抹平差异。
+        raw_bodies = upstream_input.get("bodies")
+        if isinstance(raw_bodies, list):
+            upstream_input = dict(upstream_input)
+            upstream_input["bodies"] = [
+                {k: v for k, v in body.items() if not (k == "mass" and float(v) == 0.0)}
+                if isinstance(body, dict) else body
+                for body in raw_bodies
+            ]
+            raw_bodies = upstream_input["bodies"]
+
         request = super().prepare(upstream_input)
+
+        # 标记静态体：原始请求未提供 mass，或显式 mass=0（已在上一步移除）
+        for raw_body, item in zip(raw_bodies or [], request["bodies"]):
+            item["static"] = not ("mass" in raw_body)
+
         # 再用我们自己的 prepare_capture 解析 capture（含 render 字段）
         request["capture"] = self.prepare_capture(capture_value, request["steps"])
         return request
@@ -107,8 +189,12 @@ class RtxQueueWithFrameCapture(RtxQueue):
             root.AddTranslateOp().Set(Gf.Vec3d(*body["position"]))
             qx, qy, qz, qw = body["orientation_xyzw"]
             root.AddOrientOp().Set(Gf.Quatf(qw, Gf.Vec3f(qx, qy, qz)))
-            UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
-            UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(body["mass"])
+            rigid = UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+            if body.get("static"):
+                # 静态体：运动学刚体，不受重力、不响应接触冲量，位姿保持不变
+                rigid.CreateKinematicEnabledAttr(True)
+            else:
+                UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(body["mass"])
             visual_path = path + "/Visual"
             if body["shape"] == "mesh":
                 asset = Path(body["asset"])
@@ -159,29 +245,42 @@ class RtxQueueWithFrameCapture(RtxQueue):
             # ------- 逐帧采集 + 逐帧渲染（capture_spec 存在即强制）-------
             capture_spec = request.get("capture")
             frame_records: list[dict] = []
+            cancelled = False
 
             if capture_spec:
+                self._progress(phase="simulating",
+                               frames_total=len(capture_spec["frames"]), frames_done=0)
                 frames_dir = directory / "frames"
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 frame_capture_ctx = self._init_frame_render(stage, request)
-                stepped = 0
-                for frame in capture_spec["frames"]:
-                    physics.step(frame - stepped, request["dt"])
-                    stepped = frame
-                    frame_dir = frames_dir / f"frame_{frame:06d}"
-                    frame_dir.mkdir(parents=True, exist_ok=True)
-                    state_npz = frame_dir / "state.npz"
-                    np.savez(state_npz,
-                             frame=np.int32(frame),
-                             time=np.float64(frame * request["dt"]),
-                             poses_xyzw=rigids.get_transforms().numpy().copy(),
-                             velocities=rigids.get_velocities().numpy().copy())
-                    record: dict = {"frame": frame, "state_npz": str(state_npz)}
-                    record.update(self._render_one_frame(frame, frame_dir, rigids, paths, frame_capture_ctx))
-                    frame_records.append(record)
-                self._shutdown_frame_render(frame_capture_ctx)
+                try:
+                    stepped = 0
+                    for frame in capture_spec["frames"]:
+                        if self._is_cancelled():
+                            cancelled = True
+                            break
+                        physics.step(frame - stepped, request["dt"])
+                        stepped = frame
+                        frame_dir = frames_dir / f"frame_{frame:06d}"
+                        frame_dir.mkdir(parents=True, exist_ok=True)
+                        state_npz = frame_dir / "state.npz"
+                        np.savez(state_npz,
+                                 frame=np.int32(frame),
+                                 time=np.float64(frame * request["dt"]),
+                                 poses_xyzw=rigids.get_transforms().numpy().copy(),
+                                 velocities=rigids.get_velocities().numpy().copy())
+                        record: dict = {"frame": frame, "state_npz": str(state_npz)}
+                        record.update(self._render_one_frame(frame, frame_dir, rigids, paths, frame_capture_ctx))
+                        frame_records.append(record)
+                        self._progress(frames_done=len(frame_records))
+                finally:
+                    self._shutdown_frame_render(frame_capture_ctx)
             else:
-                physics.step(request["steps"], request["dt"])
+                if self._is_cancelled():
+                    cancelled = True
+                if not cancelled:
+                    physics.step(request["steps"], request["dt"])
+                self._progress(phase="simulating", frames_total=0, frames_done=0)
 
             physics_seconds = time.perf_counter() - tick
             poses = rigids.get_transforms().numpy().copy()
@@ -197,8 +296,11 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
                 xform.ClearXformOpOrder()
                 xform.AddTransformOp().Set(matrix)
-                bodies.append({"id": by_path[path]["id"], "prim_path": path,
-                               "pose_xyzw": pose.tolist(), "velocity": velocity.tolist()})
+                body_spec = by_path[path]
+                # 静态体（运动学）速度语义固定为 0
+                out_velocity = [0.0] * 6 if body_spec.get("static") else velocity.tolist()
+                bodies.append({"id": body_spec["id"], "prim_path": path,
+                               "pose_xyzw": pose.tolist(), "velocity": out_velocity})
             np.savez(directory / "state.npz", poses_xyzw=poses, velocities=velocities)
             result = {"isaac_sim": self.runtime_version, "physics_device": str(physics.view.device),
                       "physical_gpu": self.health()["physical_gpu"], "native_rtx": self.native_rtx,
@@ -219,15 +321,19 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 physics.close()
                 physics = None
 
-            # ------- 尾帧渲染（Camera/Lights 已在物理 step 前创建，这里只 capture）-------
-            if capture:
+            # ------- 尾帧渲染（取消时跳过，已写出的帧产物仍可下载）-------
+            if capture and not cancelled:
+                self._progress(phase="rendering")
                 image = directory / "render.png"
                 result["render"] = self.capture_scene(stage, capture, image)
                 result["image"] = str(image)
 
+            self._progress(phase="writing_artifacts")
             stage.GetRootLayer().Export(str(directory / "scene.usdc"))
             persist(directory / "simulation.json", result)
             result["simulation_result"] = str(directory / "simulation.json")
+            if cancelled:
+                result["_cancelled"] = True
             return result
         finally:
             if physics is not None:
