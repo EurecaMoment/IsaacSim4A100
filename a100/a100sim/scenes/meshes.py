@@ -21,26 +21,32 @@ def mesh_shape(prim: Usd.Prim, matrix: np.ndarray) -> mi.Mesh:
     indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get(), np.int32)
     if not len(points) or np.any(counts < 3) or counts.sum() != len(indices):
         raise ValueError(f"Invalid native mesh topology: {prim.GetPath()}")
-    # Triangulate face corners while preserving their distinct UVs and normals.
-    corners, face_numbers, base = [], [], 0
-    for face, count in enumerate(counts):
-        for index in range(1, int(count) - 1):
-            corners.extend((base, base + index, base + index + 1))
-            face_numbers.extend((face,) * 3)
-        base += int(count)
-    corners = np.asarray(corners)
-    vertex_indices = indices[corners]
+    # Native triangle soups already use Mitsuba's corner order, including
+    # face-varying UV and normal seams. Other polygons retain their fan order.
+    triangles = np.all(counts == 3)
+    corners = None
+    if triangles:
+        vertex_indices = indices
+    else:
+        triangles_per_face = counts - 2
+        starts = np.cumsum(counts, dtype=np.intp) - counts
+        first = np.repeat(starts, triangles_per_face)
+        triangle_starts = np.cumsum(triangles_per_face, dtype=np.intp) - triangles_per_face
+        offset = np.arange(len(first)) - np.repeat(triangle_starts, triangles_per_face)
+        corners = np.column_stack((first, first + offset + 1, first + offset + 2)).reshape(-1)
+        vertex_indices = indices[corners]
+    corner_count = len(vertex_indices)
 
     def per_corner(value: Any, interpolation: str) -> np.ndarray:
         value = np.asarray(value)
         if interpolation in ("vertex", "varying"):
             return value[vertex_indices]
         if interpolation == "faceVarying":
-            return value[corners]
+            return value if triangles else value[corners]
         if interpolation == "uniform":
-            return value[face_numbers]
+            return np.repeat(value, (counts - 2) * 3, axis=0)
         if interpolation == "constant" and len(value) == 1:
-            return np.repeat(value, len(corners), axis=0)
+            return np.repeat(value, corner_count, axis=0)
         raise ValueError(f"Unsupported native interpolation: {interpolation}")
 
     positions = points[vertex_indices]
@@ -55,7 +61,7 @@ def mesh_shape(prim: Usd.Prim, matrix: np.ndarray) -> mi.Mesh:
         value = UsdGeom.PrimvarsAPI(prim).GetPrimvar("a100sim:" + name)
         if value and value.HasValue():
             channels[name] = per_corner(value.ComputeFlattened(), value.GetInterpolation())
-    channels = read_mesh_channels(channels, len(corners))
+    channels = read_mesh_channels(channels, corner_count)
     surface, emitter = native_surface(prim, vertex_color=rgb is not None, channels=tuple(channels))
     props = mi.Properties()
     props["bsdf"] = mi.load_dict(surface)
@@ -63,8 +69,8 @@ def mesh_shape(prim: Usd.Prim, matrix: np.ndarray) -> mi.Mesh:
         props["emitter"] = mi.load_dict(emitter)
     shape = mi.Mesh(
         str(prim.GetPath()),
-        vertex_count=len(corners),
-        face_count=len(corners) // 3,
+        vertex_count=corner_count,
+        face_count=corner_count // 3,
         props=props,
         has_vertex_normals=normals is not None,
         has_vertex_texcoords=uv is not None,
@@ -75,7 +81,7 @@ def mesh_shape(prim: Usd.Prim, matrix: np.ndarray) -> mi.Mesh:
         shape.add_attribute("vertex_" + name, 1, np.asarray(channel, np.float32))
     params = mi.traverse(shape)
     params["vertex_positions"] = (positions @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32).reshape(-1)
-    params["faces"] = np.arange(len(corners), dtype=np.uint32)
+    params["faces"] = np.arange(corner_count, dtype=np.uint32)
     if normals is not None:
         normals = normals @ np.linalg.inv(matrix[:3, :3])
         normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-10)

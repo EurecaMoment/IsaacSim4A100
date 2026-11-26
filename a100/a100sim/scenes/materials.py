@@ -14,11 +14,19 @@ from PIL import Image
 from pxr import Usd, UsdShade
 
 
+# Decode the 256 possible file samples once, with the same float32 transfer
+# used for full-resolution textures. Apply shader overrides before filtering.
+_RAW_SAMPLES = np.arange(256, dtype=np.float32) / 255
+_LINEAR_SAMPLES = np.where(
+    _RAW_SAMPLES <= 0.04045, _RAW_SAMPLES / 12.92, ((_RAW_SAMPLES + 0.055) / 1.055) ** 2.4
+)
+
+
 @lru_cache(maxsize=48)
 def pixels(path: str) -> np.ndarray:
     """Read native texture channels into a bounded cache of RGBA arrays."""
     with Image.open(path) as image:
-        return np.asarray(image.convert("RGBA"), np.float32) / 255
+        return np.asarray(image.convert("RGBA"))
 
 
 def input_value(shader: UsdShade.Shader, name: str, default: Any = None) -> Any:
@@ -45,15 +53,22 @@ def bitmap(
     """Create a texture with explicit channel selection and color transfer."""
     if channel is None and multiply is None:
         return {"type": "bitmap", "filename": path, "raw": raw, "wrap_mode": "repeat"}
-    data = pixels(path)
+    source = pixels(path)
+    samples = _RAW_SAMPLES if raw or channel is not None else _LINEAR_SAMPLES
     if channel is not None:
-        data = data[:, :, channel : channel + 1]
+        source = source[:, :, channel : channel + 1]
     else:
-        data = data[:, :, :3]
-        if not raw:
-            data = np.where(data <= 0.04045, data / 12.92, ((data + 0.055) / 1.055) ** 2.4)
-    if multiply is not None:
-        data = data * np.asarray(multiply)
+        source = source[:, :, :3]
+    scale = np.asarray(multiply if multiply is not None else 1.0)
+    if scale.ndim == 0 or np.all(scale == scale.flat[0]):
+        factor = scale if scale.ndim == 0 else scale[:1]
+        table = (samples * factor).astype(np.float32)
+        data = table[source]
+    else:
+        tables = (samples[:, None] * scale).astype(np.float32)
+        data = np.empty(source.shape, dtype=np.float32)
+        for index in range(source.shape[2]):
+            data[:, :, index] = tables[:, index][source[:, :, index]]
     return {
         "type": "bitmap",
         "bitmap": mi.Bitmap(np.ascontiguousarray(data, np.float32)),
@@ -195,7 +210,7 @@ def native_surface(
     if source == "MI_DoorEntrance_glass" and albedo:
         # This material's MDL explicitly uses diffuse alpha as surface opacity.
         alpha = np.clip(
-            pixels(albedo)[:, :, 3:4] * float(input_value(shader, "Opacity_Multiply", 1))
+            _RAW_SAMPLES[pixels(albedo)[:, :, 3:4]] * float(input_value(shader, "Opacity_Multiply", 1))
             + float(input_value(shader, "Opacity_Add", 0)),
             0,
             1,
@@ -210,7 +225,7 @@ def native_surface(
         color = np.asarray(input_value(shader, "EmissionColor", [0, 0, 0]))[:3]
         intensity = float(input_value(shader, "EmissionIntensity", 0))
         if intensity > 0 and color.max() > 0:
-            data = pixels(orm)[:, :, 3:4] * color * intensity
+            data = _RAW_SAMPLES[pixels(orm)[:, :, 3:4]] * color * intensity
             emitter = {
                 "type": "area",
                 "radiance": {
