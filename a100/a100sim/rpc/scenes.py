@@ -46,11 +46,12 @@ class SceneBackend(SimulatorBackend):
     async def describe(self) -> list[pb.Capability]:
         """Advertise scene operations only when their independent worker is ready."""
         capabilities = await super().describe()
-        ready = (await self.health()).get("scenes", {}).get("status") == "ready"
+        worker = (await self.health()).get("scenes", {})
+        ready = worker.get("status") == "ready"
         for item in capabilities:
             if item.name.removeprefix("extension.") in OPERATIONS:
                 item.availability = pb.AVAILABLE if ready else pb.UNAVAILABLE
-                item.reason = "" if ready else "The scene worker is not ready"
+                item.reason = "" if ready else worker.get("reason", "The scene worker is not ready")
         return capabilities
 
     async def scene_task(self, operation: str, arguments: dict[str, Any], directory: Path) -> dict[str, Any]:

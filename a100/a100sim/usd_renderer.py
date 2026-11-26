@@ -159,7 +159,7 @@ def add_stage_geometry(scene, stage, mode, cache):
 
 
 def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, gaussian_gain=1.0,
-                 annotations=False, cameras=None):
+                 annotations=False, cameras=None, individual_views=False):
     if mi.variant() not in {"cuda_ad_rgb", "llvm_ad_rgb", "scalar_rgb"}:
         raise RuntimeError("Render variant must be cuda_ad_rgb, llvm_ad_rgb, or scalar_rgb")
     expected_backend = {
@@ -212,7 +212,7 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
     # Bound temporary wavefront storage on CPU while retaining the requested
     # total sample count. Mitsuba accumulates all passes into the same film.
     if render_backend == "llvm_ad_rgb":
-        film_pixels = size * size * (len(cameras) if cameras is not None else 1)
+        film_pixels = size * size * (len(cameras) if cameras is not None and not individual_views else 1)
         max_pass_spp = max(1, (4 * 1024 * 1024) // film_pixels)
         if spp > max_pass_spp:
             scene["integrator"]["samples_per_pass"] = next(
@@ -235,16 +235,61 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
             sensor = {**scene["sensor"], "fov": angle, "to_world": mi.ScalarTransform4f.look_at(
                 origin=matrix[:3, 3], target=matrix[:3, 3] - matrix[:3, 2], up=matrix[:3, 1])}
             camera_specs.append((path, matrix, angle, sensor))
-        batch = {"type": "batch", "film": {**scene["sensor"]["film"], "width": size * len(cameras)}}
-        for index, (_, _, _, sensor) in enumerate(camera_specs):
-            batch[f"camera_{index:04d}"] = {key: value for key, value in sensor.items() if key != "film"}
-        scene["sensor"] = batch
+        if not individual_views:
+            batch = {"type": "batch", "film": {**scene["sensor"]["film"], "width": size * len(cameras)}}
+            for index, (_, _, _, sensor) in enumerate(camera_specs):
+                batch[f"camera_{index:04d}"] = {key: value for key, value in sensor.items() if key != "film"}
+            scene["sensor"] = batch
     scene = mi.load_dict(scene)
     surface_ids = None
     if annotations:
         from .annotations import prepare_surface_ids
         surface_ids = prepare_surface_ids(scene, stage, sources)
     setup_seconds = time.perf_counter() - started
+    def write_view(camera_path, camera_world, fov, sensor, output, setup_seconds):
+        tick = time.perf_counter()
+        image = mi.render(scene, sensor=sensor, spp=spp, seed=seed)
+        dr.eval(image)
+        dr.sync_thread()
+        render_seconds = time.perf_counter() - tick
+        output.parent.mkdir(parents=True, exist_ok=True)
+        mi.util.write_bitmap(str(output), image, write_async=False)
+        annotation_result = None
+        if annotations:
+            from .annotations import capture_primary_surfaces
+
+            annotation_result = capture_primary_surfaces(scene, stage, sources, camera_world, output.with_suffix(""),
+                                                         sensor=sensor, surface_ids=surface_ids)
+        return {
+            "mode": mode,
+            "renderer": renderer,
+            "render_backend": render_backend,
+            "native_rtx": False,
+            "cpu_fallback": cpu_fallback,
+            "resolution": [size, size],
+            "spp": spp,
+            "gaussian_gain": float(gaussian_gain) if mode == "gaussian" else None,
+            "setup_seconds": setup_seconds,
+            "render_seconds": render_seconds,
+            "image": output.name,
+            "camera": camera_path,
+            "camera_world": camera_world.tolist(),
+            "fov_degrees": fov,
+            "usd_sources": sources,
+            **({"annotations": annotation_result} if annotation_result else {}),
+        }
+
+    output = Path(output)
+    if individual_views:
+        frames = []
+        for index, (path, matrix, angle, config) in enumerate(camera_specs):
+            sensor = scene.sensors()[0] if index == 0 else mi.load_dict(config)
+            frame = write_view(path, matrix, angle, sensor, output / f"view_{index}.png",
+                               setup_seconds if index == 0 else 0.0)
+            frames.append(frame)
+        return {"frames": frames}
+    if camera_specs is None:
+        return write_view(camera_path, camera_world, fov, scene.sensors()[0], output, setup_seconds)
     tick = time.perf_counter()
     image = mi.render(scene, spp=spp, seed=seed)
     dr.eval(image)
@@ -279,31 +324,6 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
                 "geometry_builds": 1, "render_launches": 1, "usd_sources": sources,
                 "renderer": renderer, "render_backend": render_backend,
                 "native_rtx": False, "cpu_fallback": cpu_fallback}
-    mi.util.write_bitmap(str(output), image, write_async=False)
-    annotation_result = None
-    if annotations:
-        from .annotations import capture_primary_surfaces
-
-        annotation_result = capture_primary_surfaces(scene, stage, sources, camera_world, output.with_suffix(""),
-                                                     surface_ids=surface_ids)
-    return {
-        "mode": mode,
-        "renderer": renderer,
-        "render_backend": render_backend,
-        "native_rtx": False,
-        "cpu_fallback": cpu_fallback,
-        "resolution": [size, size],
-        "spp": spp,
-        "gaussian_gain": float(gaussian_gain) if mode == "gaussian" else None,
-        "setup_seconds": setup_seconds,
-        "render_seconds": render_seconds,
-        "image": output.name,
-        "camera": camera_path,
-        "camera_world": camera_world.tolist(),
-        "fov_degrees": fov,
-        "usd_sources": sources,
-        **({"annotations": annotation_result} if annotation_result else {}),
-    }
 
 
 def render_cameras(stage, cameras, directory, size=512, spp=32, annotations=True):

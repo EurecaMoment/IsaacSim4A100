@@ -30,17 +30,22 @@ def run_capture(stage, metadata, values, directory):
     if metadata["observation"] is None:
         raise ValueError("Settle the scene before capture")
     validate_retained_poses(stage, metadata["observation"]["bodies"])
-    frames = []
-    for index, camera in enumerate(cameras):
-        image = directory / f"view_{index}.png"
-        frame = render_stage(
-            stage, camera, "mesh", image, size=size, spp=spp, annotations=values.get("annotations", True)
-        )
-        frame["image"] = str(image)
+    frames = render_stage(
+        stage,
+        cameras[0],
+        "mesh",
+        directory,
+        size=size,
+        spp=spp,
+        annotations=values.get("annotations", True),
+        cameras=cameras,
+        individual_views=True,
+    )["frames"]
+    for frame in frames:
+        frame["image"] = str(directory / frame["image"])
         for key in ("arrays", "labels"):
             if key in frame.get("annotations", {}):
                 frame["annotations"][key] = str(directory / frame["annotations"][key])
-        frames.append(frame)
     return {
         "frames": frames,
         "physics_tick": metadata["physics_tick"],

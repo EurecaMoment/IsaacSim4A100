@@ -83,8 +83,8 @@ class AssetStore:
                     chunk = await anext(chunks, None)
                 if first.sha256 and digest.hexdigest() != first.sha256.lower():
                     raise ValueError("Uploaded contents do not match sha256")
-                stream.flush()
-                os.fsync(stream.fileno())
+                await asyncio.to_thread(stream.flush)
+                await asyncio.to_thread(os.fsync, stream.fileno())
             # Hard-link creation is atomic and refuses to replace an existing file.
             try:
                 os.link(temporary, destination)

@@ -194,10 +194,15 @@ class SimulatorBackend:
                 return self._health_cache
 
             async def probe(name: str) -> tuple[str, dict[str, Any]]:
-                try:
-                    return name, await self._request(name, "/health", timeout=1)
-                except ServiceError:
-                    return name, {"status": "unavailable"}
+                # A busy Kit process can stall its Python HTTP handler while loading USD.
+                # Confirm a missed deadline on a fresh read. Hard failures return immediately.
+                for timeout in (1, 4):
+                    try:
+                        return name, await self._request(name, "/health", timeout=timeout)
+                    except ServiceError as error:
+                        if not isinstance(error.__cause__, TimeoutError):
+                            return name, {"status": "unavailable", "reason": str(error)}
+                return name, {"status": "unavailable", "reason": "Worker health checks timed out"}
 
             self._health_cache = dict(await asyncio.gather(*(probe(name) for name in self.settings.backend_urls)))
             self._health_checked = time.monotonic()

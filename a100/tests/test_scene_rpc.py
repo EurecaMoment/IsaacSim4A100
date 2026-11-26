@@ -42,6 +42,20 @@ class SceneTransportTests(unittest.IsolatedAsyncioTestCase):
             extensions = {item.name: item.availability for item in catalog if item.name.startswith("extension.")}
             self.assertEqual(extensions, {"extension." + name: expected for name in OPERATIONS})
 
+    async def test_scene_health_confirms_deadline_without_resubmitting(self) -> None:
+        timeout = ServiceError(grpc.StatusCode.UNAVAILABLE, "missed health deadline")
+        timeout.__cause__ = TimeoutError()
+        self.backend._request = AsyncMock(side_effect=[timeout, {"status": "ready"}])
+        self.assertEqual((await self.backend.health())["scenes"]["status"], "ready")
+        self.assertEqual(self.backend._request.await_count, 2)
+        for call in self.backend._request.await_args_list:
+            self.assertEqual(call.args, ("scenes", "/health"))
+        self.backend._health_checked = 0
+        self.backend._request = AsyncMock(side_effect=timeout)
+        result = (await self.backend.health())["scenes"]
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("timed out", result["reason"])
+
     async def test_live_capabilities_publish_complete_scene_parameter_schemas(self) -> None:
         self.backend.health = AsyncMock(return_value={"scenes": {"status": "ready"}})
         catalog = await self.backend.describe()
