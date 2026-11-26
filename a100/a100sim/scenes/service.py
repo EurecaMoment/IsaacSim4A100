@@ -5,25 +5,82 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import queue
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from a100sim.network import require_loopback
 from a100sim.scenes.capture_pool import CapturePool
 from a100sim.scenes.contracts import OPERATIONS
 from a100sim.service_queue import JobQueue, start_http
 
-if TYPE_CHECKING:
-    from a100sim.scenes.sessions import Sessions
-
 LOGGER = logging.getLogger(__name__)
+
+
+def serve_sessions(connection, root):
+    """Own Kit and its mutable USD stages on the child process's main thread."""
+    from a100sim.app import create_app
+
+    app = create_app()
+    try:
+        from a100sim.scenes.sessions import Sessions
+
+        sessions = Sessions(root)
+        connection.send((True, None))
+        while True:
+            try:
+                payload, directory = connection.recv()
+            except EOFError:
+                break
+            try:
+                result = sessions.execute(payload, directory)
+            except Exception as error:
+                LOGGER.exception("Kit scene operation failed")
+                connection.send((False, str(error)))
+            else:
+                connection.send((True, result))
+    finally:
+        connection.close()
+        app.close()
+
+
+class KitSessions:
+    """Keep the loopback HTTP queue responsive while native scene calls hold the GIL."""
+
+    def __init__(self, root, target=serve_sessions):
+        self.root = root
+        context = multiprocessing.get_context("spawn")
+        self.connection, child = context.Pipe()
+        self.process = context.Process(target=target, args=(child, root), name="isaac-kit")
+        self.process.start()
+        child.close()
+
+    def receive(self):
+        try:
+            ok, value = self.connection.recv()
+        except EOFError as error:
+            raise RuntimeError("Kit scene process exited") from error
+        if not ok:
+            raise ValueError(value)
+        return value
+
+    def execute(self, payload, directory):
+        self.connection.send((payload, directory))
+        return self.receive()
+
+    def close(self):
+        self.connection.close()
+        self.process.join(5)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(5)
 
 
 class SceneQueue(JobQueue):
     """Serialize Kit mutations and dispatch immutable captures to bounded workers."""
 
-    sessions: Sessions
+    sessions: KitSessions
 
     captures = None
 
@@ -81,13 +138,10 @@ def main() -> None:
     args = parser.parse_args()
     state = SceneQueue(args.output / "jobs", 64, "Isaac Sim 6.2 retained CUDA scenes")
     server = start_http(state, args.host, args.port, "/scene")
-    from a100sim.app import create_app
-
-    app = create_app()
+    sessions = KitSessions(args.output / "sessions")
     try:
-        from a100sim.scenes.sessions import Sessions
-
-        state.sessions = Sessions(args.output / "sessions")
+        sessions.receive()
+        state.sessions = sessions
         state.captures = CapturePool(state)
         state.details = {
             "operations": sorted(OPERATIONS),
@@ -96,13 +150,19 @@ def main() -> None:
         }
         state.ready = True
         print("SCENE_SERVICE_READY", json.dumps(state.health()), flush=True)
-        state.work_forever()
+        while sessions.process.is_alive():
+            try:
+                item = state.jobs.get(timeout=1)
+            except queue.Empty:
+                continue
+            state.run_one(item)
+        raise RuntimeError("Kit scene process exited")
     finally:
         state.ready = False
         server.shutdown()
         if state.captures:
             state.captures.executor.shutdown(wait=True)
-        app.close()
+        sessions.close()
 
 
 if __name__ == "__main__":
