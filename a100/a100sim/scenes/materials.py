@@ -13,13 +13,10 @@ from a100sim.materials import read_usd_material
 from PIL import Image
 from pxr import Usd, UsdShade
 
-
 # Decode the 256 possible file samples once, with the same float32 transfer
 # used for full-resolution textures. Apply shader overrides before filtering.
 _RAW_SAMPLES = np.arange(256, dtype=np.float32) / 255
-_LINEAR_SAMPLES = np.where(
-    _RAW_SAMPLES <= 0.04045, _RAW_SAMPLES / 12.92, ((_RAW_SAMPLES + 0.055) / 1.055) ** 2.4
-)
+_LINEAR_SAMPLES = np.where(_RAW_SAMPLES <= 0.04045, _RAW_SAMPLES / 12.92, ((_RAW_SAMPLES + 0.055) / 1.055) ** 2.4)
 
 
 @lru_cache(maxsize=48)
