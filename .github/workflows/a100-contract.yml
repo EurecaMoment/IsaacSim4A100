@@ -1,12 +1,12 @@
-name: A100 contract
+name: Simulator contracts
 
 on:
   push:
-    branches: [A100]
-    paths: ["a100/**", ".github/workflows/a100-contract.yml"]
+    branches: [A100, main, "merge/**"]
+    paths: ["a100/**", "rtx4090_grpc/**", ".github/workflows/a100-contract.yml"]
   pull_request:
-    branches: [A100]
-    paths: ["a100/**", ".github/workflows/a100-contract.yml"]
+    branches: [A100, main, "merge/**"]
+    paths: ["a100/**", "rtx4090_grpc/**", ".github/workflows/a100-contract.yml"]
   workflow_dispatch:
 
 permissions:
@@ -37,5 +37,12 @@ jobs:
           bash -n a100/start-scenes.sh
       - name: Run CPU transport and service contracts
         env:
-          PYTHONPATH: a100:a100/tests
+          PYTHONPATH: .:a100:a100/tests
         run: python -m unittest -v test_contract test_features test_grpc test_portability test_scene_rpc
+      - name: Verify RTX transport, camera and USD contracts
+        run: |
+          python -m pip install numpy Pillow usd-core
+          python rtx4090_grpc/tests/test_servicer_unit.py
+          python rtx4090_grpc/tests/test_job_manager.py
+          python rtx4090_grpc/tests/test_views.py
+          python rtx4090_grpc/tests/test_retained_lights.py
