@@ -178,7 +178,7 @@ def native_surface(
     """Map supported native MDL inputs to PBR; reject unknown shader programs."""
     material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
     shader = material.ComputeSurfaceSource("mdl")[0] if material else None
-    if not shader:
+    if not shader or shader.GetIdAttr().Get() == "UsdPreviewSurface":
         return read_usd_material(prim, vertex_color=vertex_color, channels=channels), None
     source = str(shader.GetPrim().GetAttribute("info:mdl:sourceAsset:subIdentifier").Get())
     if source == "MI_DoorA":
