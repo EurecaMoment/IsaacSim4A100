@@ -14,11 +14,13 @@ from concurrent import futures
 from pathlib import Path
 
 import grpc
+from google.protobuf.empty_pb2 import Empty
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "a100"))
 
-from server import rpc  # noqa: E402
+from server import codec, rpc  # noqa: E402
 from server import job_manager  # noqa: E402
 from server.servicer import SimulationServicer  # noqa: E402
 
@@ -146,6 +148,26 @@ def main() -> int:
             assert health.api_version == "1.0.0"
             assert health.artifacts_free_bytes == 1024
             assert health.retention_seconds == 604800
+
+            operations = {item.name for item in stub.GetCapabilities(Empty(), timeout=5).capabilities}
+            assert "extension.scene.capture" in operations and "extension.scene.preview" in operations
+            feature = pb.SubmitJobRequest(request_id="feature")
+            feature.native_feature.feature_id = "sessions.scene.inspect"
+            feature.native_feature.arguments.update({"session_id": DONE_ID})
+            assert stub.SubmitJob(feature, timeout=5).state == "queued"
+            assert manager.submitted[-1] == ("feature", {"workload": "native_feature", "retained": {
+                "operation": "scene.inspect", "arguments": {"session_id": DONE_ID}}})
+            feature.native_feature.request_id = "different"
+            try:
+                stub.SubmitJob(feature, timeout=5)
+                raise AssertionError("a contradictory native request id was accepted")
+            except grpc.RpcError as error:
+                assert error.code() == grpc.StatusCode.INVALID_ARGUMENT
+            retained = codec.job_to_proto({"id": DONE_ID, "state": "succeeded",
+                "request_id": "old-receipt", "native_operation": "scene.preview",
+                "native_result": {"image": "artifact://image"}})
+            assert retained.native_job.job_id == retained.id
+            assert retained.native_job.result["image"] == "artifact://image"
 
             # SubmitJob：request_id + simulation 透传
             sim = pb.SimulateRequest()

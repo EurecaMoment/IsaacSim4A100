@@ -45,7 +45,8 @@ class RtxQueueWithFrameCapture(RtxQueue):
             "max_views": MAX_VIEWS,
             "max_image_size": MAX_IMAGE_SIZE, "max_samples_per_pixel": MAX_SAMPLES_PER_PIXEL,
             "capabilities": ["multiview_final", "multiview_frames", "metric_depth",
-                             "semantic_masks", "instance_masks", "visible_bboxes", "registered_mesh_npz"],
+                             "semantic_masks", "instance_masks", "visible_bboxes", "registered_mesh_npz",
+                             "native_operations", "native_task_api", "native_scene_sessions"],
         }
 
     def _progress(self, **kw) -> None:
@@ -110,6 +111,8 @@ class RtxQueueWithFrameCapture(RtxQueue):
     # ------------------------------------------------------------------
 
     def prepare(self, value: dict) -> dict:
+        if "retained" in value:
+            return value
         # 先把 capture 摘出来，让上游 prepare 能过 unknown 字段检查
         capture_value = value.get("capture")
         upstream_input = {k: v for k, v in value.items() if k != "capture"}
@@ -166,6 +169,22 @@ class RtxQueueWithFrameCapture(RtxQueue):
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, Vt
         import omni.usd
 
+        if "retained" in request:
+            from a100sim.rpc.storage import AssetStore
+            from .rpc import native_pb2
+            from .retained_sessions import RetainedSessions
+            from .retained_api import artifact_handles
+            from .job_manager import _artifact_id
+
+            command = request["retained"]
+            arguments = dict(command["arguments"])
+            if command["operation"] == "asset.import":
+                source = arguments.pop("source")
+                assets = AssetStore(ASSET_ROOT, 0, messages=native_pb2)
+                arguments["source_path"] = str(assets.resolve(**source))
+            sessions = RetainedSessions(self.output.parent / "sessions", self)
+            result = sessions.execute({"operation": command["operation"], **arguments}, directory)
+            return {"native_result": artifact_handles(result, directory, _artifact_id)}
         self.body_ids = [body["id"] for body in request["bodies"]]
 
         started = time.perf_counter()
@@ -414,17 +433,11 @@ class RtxQueueWithFrameCapture(RtxQueue):
     # RTX 逐帧渲染辅助方法（每次任务生命周期内复用 product / annotators）
     # ------------------------------------------------------------------
 
-    def _init_frame_render(self, stage: Any, request: dict) -> dict:
-        """创建一次 render_product + annotators + warmup，复用全程。"""
+    @staticmethod
+    def _configure_rtx():
         import carb
         import omni.kit.app
         import omni.replicator.core as rep
-        from isaacsim.core.experimental.utils.semantics import add_labels
-        from pxr import UsdLux
-
-        render = request.get("render")
-        if not render:
-            raise ValueError("capture.render=true requires render spec (camera/lighting)")
 
         settings = carb.settings.get_settings()
         if not omni.kit.app.get_app().get_extension_manager().is_extension_enabled("omni.hydra.rtx"):
@@ -435,6 +448,18 @@ class RtxQueueWithFrameCapture(RtxQueue):
         settings.set("/rtx/post/tonemap/whitepoint", 6500.0)
         settings.set("/rtx/post/tonemap/enabled", True)
         rep.orchestrator.set_capture_on_play(False)
+
+    def _init_frame_render(self, stage: Any, request: dict) -> dict:
+        """创建一次 render_product + annotators + warmup，复用全程。"""
+        import omni.replicator.core as rep
+        from isaacsim.core.experimental.utils.semantics import add_labels
+        from pxr import UsdLux
+
+        render = request.get("render")
+        if not render:
+            raise ValueError("capture.render=true requires render spec (camera/lighting)")
+
+        self._configure_rtx()
 
         lighting = render.get("lighting", {})
         # 转 radiance → photometric intensity（与 capture_scene 一致）

@@ -11,12 +11,13 @@ import shutil
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import grpc
 
 from a100sim.rpc.errors import ServiceError
-from a100sim.rpc.v1 import simulator_pb2 as pb
+if TYPE_CHECKING:
+    from a100sim.rpc.v1 import simulator_pb2 as pb
 
 ASSET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
@@ -24,7 +25,10 @@ ASSET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 class AssetStore:
     """Keep uploaded files inside an explicitly configured asset directory."""
 
-    def __init__(self, root: Path, max_bytes: int) -> None:
+    def __init__(self, root: Path, max_bytes: int, *, messages=None) -> None:
+        if messages is None:
+            from a100sim.rpc.v1 import simulator_pb2 as messages
+        self.messages = messages
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
@@ -54,8 +58,8 @@ class AssetStore:
                     for p in directory.rglob("*")
                     if p.is_file() and not p.is_symlink() and not p.name.startswith(".upload-")
                 ]
-                assets.append(pb.Asset(asset_id=directory.name, files=sorted(files)))
-        return pb.AssetList(assets=assets)
+                assets.append(self.messages.Asset(asset_id=directory.name, files=sorted(files)))
+        return self.messages.AssetList(assets=assets)
 
     async def upload(self, chunks: AsyncIterator[pb.UploadChunk]) -> pb.AssetFile:
         """Atomically publish one bounded file after validating its optional digest."""
@@ -93,7 +97,7 @@ class AssetStore:
                 raise ServiceError(
                     grpc.StatusCode.ALREADY_EXISTS, "Asset files are immutable; use a new path"
                 ) from error
-            return pb.AssetFile(
+            return self.messages.AssetFile(
                 asset_id=asset_id, relative_path=first.relative_path, size_bytes=size, sha256=digest.hexdigest()
             )
         finally:

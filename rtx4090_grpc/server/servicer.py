@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import os
 from typing import Any
 
 import grpc
@@ -38,9 +40,50 @@ class SimulationServicer(pb_grpc.SimulationServiceServicer):
         return codec.health_to_proto(record)
 
     # ------------------------------------------------------------------
-    def SubmitJob(self, request: pb.SubmitJobRequest, context) -> pb.JobHandle:
-        payload = codec.simulate_request_to_payload(request.simulation)
+    def GetCapabilities(self, request, context):
+        from .retained_api import capabilities
+
+        return capabilities(self._manager.health())
+
+    def GetApiCatalog(self, request, context):
+        from .retained_api import catalog
+
+        return catalog(self._manager.health())
+
+    def _assets(self):
+        from a100sim.rpc.storage import AssetStore
+        from a100sim.service_queue import ASSET_ROOT
+        from .rpc import native_pb2
+
+        return AssetStore(ASSET_ROOT, int(os.environ.get("RTX4090_MAX_UPLOAD_BYTES", 512 * 1024**2)),
+                          messages=native_pb2)
+
+    def ListAssets(self, request, context):
+        return self._assets().list_assets()
+
+    def UploadAsset(self, requests, context):
+        from a100sim.rpc.errors import ServiceError
+
+        async def chunks():
+            for chunk in requests:
+                yield chunk
         try:
+            return asyncio.run(self._assets().upload(chunks()))
+        except ServiceError as exc:
+            context.abort(exc.code, str(exc))
+        except (ValueError, TypeError) as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+
+    def SubmitJob(self, request: pb.SubmitJobRequest, context) -> pb.JobHandle:
+        try:
+            field = request.WhichOneof("workload")
+            if field == "simulation":
+                payload = codec.simulate_request_to_payload(request.simulation)
+            elif field in ("native_task", "native_feature"):
+                from .retained_api import native_payload
+                payload = native_payload(request)
+            else:
+                raise ValueError("SubmitJob requires a simulation or native workload")
             record = self._manager.submit(request.request_id, payload)
         except job_manager.IdempotencyConflict as exc:
             context.abort(grpc.StatusCode.ALREADY_EXISTS, str(exc))
@@ -104,7 +147,14 @@ class SimulationServicer(pb_grpc.SimulationServiceServicer):
     # ------------------------------------------------------------------
     def CancelJob(self, request: pb.GetJobRequest, context) -> pb.Job:
         job_id = _valid_job_id(request.job_id, context)
-        record = self._manager.cancel(job_id)
+        before = self._manager.status(job_id)
+        if before and before.get("native_operation"):
+            with self._manager.lock:
+                if self._manager.status(job_id)["state"] == "running":
+                    context.abort(grpc.StatusCode.FAILED_PRECONDITION, "The retained operation is already running")
+                record = self._manager.cancel(job_id)
+        else:
+            record = self._manager.cancel(job_id)
         if record is None:
             context.abort(grpc.StatusCode.NOT_FOUND, f"任务不存在: {job_id}")
         return codec.job_to_proto(record)
@@ -115,4 +165,6 @@ class SimulationServicer(pb_grpc.SimulationServiceServicer):
         if self._manager.status(job_id) is None:
             context.abort(grpc.StatusCode.NOT_FOUND, f"任务不存在: {job_id}")
         for record in self._manager.watch_iter(job_id, context.is_active):
-            yield codec.job_to_proto(record)
+            message = codec.job_to_proto(record)
+            if not message.HasField("native_job") or message.native_job.revision > request.after_revision:
+                yield message

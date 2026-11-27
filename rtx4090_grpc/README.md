@@ -1,10 +1,6 @@
 # rtx4090_grpc
 
-Isaac Sim RTX 4090 服务的 **gRPC 实现**。它与 HTTP 版（`rtx4090/service.py`）**平级、等价**：
-
-- 同一套引擎：复用 `rtx4090.service.RtxQueue`（CUDA PhysX + 原生 RTX 采集）；
-- 同一套作业队列语义：提交入队、主线程串行执行、产物按 `job_id` 落盘；
-- 差别只在**对外协议**：本服务说 gRPC，HTTP 版说 HTTP。
+服务通过 `isaacsim_rpc.v1.SimulationService` 提供 RTX 快照和持久 USD 场景。快照与持久场景共用 GPU 队列，在 Kit 主线程执行。每个持久场景拥有独立的 USD 状态，上传资产可包含 USD、纹理及其他依赖。导入保留 USD 材质网络，RTX 渲染使用场景内的相机和灯光。
 
 两者可以同时部署（建议使用不同的 `ISAAC_GPU` 和不同的产物目录），互不依赖、互不转发。
 
@@ -16,11 +12,15 @@ Isaac Sim RTX 4090 服务的 **gRPC 实现**。它与 HTTP 版（`rtx4090/servic
 
 ## 接口映射
 
-| gRPC 方法 | HTTP 版对应 | 说明 |
-|-----------|-------------|------|
-| `SimulationService.Health` | `GET /health` | 健康状态与运行时元信息 |
-| `SimulationService.SubmitJob` | `POST /simulate` | 提交任务，返回 32 位 job id |
-| `SimulationService.GetJob` | `GET /jobs/<job_id>` | 查询状态；成功时返回产物路径 |
+| gRPC 方法 | 用途 |
+| --- | --- |
+| `Health`、`GetCapabilities`、`GetApiCatalog` | 读取运行状态、当前支持的操作和参数结构 |
+| `UploadAsset`、`ListAssets` | 上传不可变文件，按同一资产 ID 和相对路径组织 USD 与纹理 |
+| `SubmitJob` | 根据工作负载字段提交快照、持久场景任务或目录功能，返回作业 ID |
+| `GetJob`、`WatchJob`、`CancelJob` | 查询、观察或请求取消已受理的作业 |
+| `DownloadArtifact`、`AckJob` | 按作业清单下载产物，确认后允许服务清理已下载的文件 |
+
+通过 `asset.import` 建立场景后，用返回的 `session_id` 继续编辑、推进物理、检查、采集或导出。`scene.preview` 返回当前持久 USD 版本的一张 PNG。`scene.capture` 使用最近一次物理推进后保存的状态，同时渲染指定的相机。开启标注时每个视角附有深度、距离、法线、实例、语义及有效像素掩码。
 
 错误码映射：参数错误→`INVALID_ARGUMENT`、任务不存在→`NOT_FOUND`、队列满→`RESOURCE_EXHAUSTED`、引擎未就绪→`UNAVAILABLE`。
 

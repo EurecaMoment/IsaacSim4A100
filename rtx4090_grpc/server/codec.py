@@ -302,4 +302,8 @@ def job_to_proto(record: dict[str, Any]) -> Any:
         message.outputs.CopyFrom(artifacts)
     if record.get("render"):
         message.render.CopyFrom(_render_info_to_proto(record["render"]))
+    if record.get("native_operation"):
+        from .retained_api import native_receipt
+
+        message.native_job.CopyFrom(native_receipt(record))
     return message

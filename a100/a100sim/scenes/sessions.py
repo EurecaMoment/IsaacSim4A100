@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import omni.usd
 from a100sim.app import Physics
 from a100sim.scenes.physics_state import snapshot_physics, validate_retained_poses
 from a100sim.service_queue import finite, integer, persist
@@ -36,6 +35,8 @@ class Sessions:
 
     def execute(self, arguments: dict[str, Any], directory: Path) -> dict[str, Any]:
         """Load an independent retained stage, execute one action and save state."""
+        import omni.usd
+
         values = dict(arguments)
         operation = values.pop("operation")
         identity = values.pop("session_id", None)
@@ -171,6 +172,14 @@ class Sessions:
         metadata["observation"] = None
         return {"changes_applied": len(values["changes"])}
 
+    @staticmethod
+    def create_physics(stage):
+        return Physics(stage)
+
+    @staticmethod
+    def mdl_library():
+        return Path(os.environ["A100SIM_ROOT"]) / "packages/isaacsim/kit/mdl/core/Base"
+
     def physics_step(
         self, stage: Usd.Stage, metadata: dict[str, Any], values: dict[str, Any], directory: Path
     ) -> dict[str, Any]:
@@ -179,7 +188,7 @@ class Sessions:
             raise ValueError("physics.step accepts steps and dt")
         steps = integer(values.get("steps", 180), "steps", 1, 1200)
         dt = finite(values.get("dt", 1 / 60), "dt", 0.0001, 0.02)
-        physics = Physics(stage)
+        physics = self.create_physics(stage)
         try:
             paths = [
                 str(p.GetPath())
@@ -286,12 +295,15 @@ class Sessions:
             validate_retained_poses(stage, metadata["observation"]["bodies"])
         scene = directory / "scene.usdc"
         exported = Usd.Stage.Open(stage.Flatten())
-        builtin = Path(os.environ["A100SIM_ROOT"]) / "packages/isaacsim/kit/mdl/core/Base"
         for prim in exported.Traverse():
             attribute = prim.GetAttribute("info:mdl:sourceAsset")
             value = attribute.Get() if attribute else None
-            if value and not value.resolvedPath and Path(value.path).name == value.path:
-                source = builtin / value.path
+            if value and Path(value.path).name == value.path:
+                # Kit can resolve an MDL search name for rendering without giving
+                # the USDZ writer a filesystem path. Author the resolved file.
+                source = Path(value.resolvedPath)
+                if not source.is_absolute() or not source.is_file():
+                    source = self.mdl_library() / value.path
                 if not source.is_file():
                     raise ValueError("The native MDL library cannot be packaged: " + value.path)
                 attribute.Set(Sdf.AssetPath(str(source)))

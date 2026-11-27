@@ -238,6 +238,8 @@ class JobManager:
             # 把 request_id / 摘要 / 初始 phase 写入 job.json
             full = self._read_record(job_id) or record
             full.update(request_id=request_id, payload_digest=digest, phase="queued")
+            if "retained" in payload:
+                full["native_operation"] = payload["retained"]["operation"]
             self._write_record(job_id, full)
             self._request_ids[request_id] = job_id
             self._notify_watchers()
