@@ -55,6 +55,7 @@ class UnifiedService(rpc.simulation_pb2_grpc.SimulationServiceServicer):
         validate_numbers(simulation)
         payload = codec.simulate_request_to_payload(simulation)
         for body in payload.get("bodies", []):
+            body.setdefault("mass", 0.0)
             handle = body.pop("asset_id", "")
             if body.get("asset") and handle:
                 raise ValueError("Choose one of asset or asset_id")
@@ -94,7 +95,10 @@ class UnifiedService(rpc.simulation_pb2_grpc.SimulationServiceServicer):
                 **worker, "status": "ready" if ready else "failed", "engine": "a100sim",
                 "native_rtx": False, "cuda_required": True, "cpu_fallback": variant != "cuda_ad_rgb",
                 "render_backend": variant, "renderer": "Mitsuba", "supported_shapes": ["cube", "sphere", "mesh"],
-                "annotators": ["rgb", "depth_m", "semantic_ids"], "api_version": "1.0.0",
+                "annotators": ["rgb", "depth_m", "semantic_ids", "instance_ids"], "api_version": "1.0.0",
+                "max_views": 32,
+                "capabilities": ["multiview_final", "multiview_frames", "metric_depth", "instance_ids",
+                                 "semantic_masks", "visible_bboxes", "registered_mesh_npz"],
                 "uptime_seconds": time.monotonic() - self.manager.started_at,
                 "queue_depth": self.manager.queue.qsize(), "queue_capacity": self.manager.settings.capacity,
                 "active_job": next((r["job_id"] for r in records if r["state"] == "RUNNING"), ""),
