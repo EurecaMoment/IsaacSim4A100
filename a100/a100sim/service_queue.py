@@ -165,6 +165,7 @@ class JobQueue:
                     "engine": self.engine, "physical_gpu": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "cuda_required": True, "cpu_fallback": False, "native_rtx": False,
                     "job_long_poll": True,
+                    "gpu_model": os.environ.get("ISAACSIM_GPU_NAME"),
                     "uptime_seconds": round(time.time() - self.started, 2),
                     "queue_depth": self.jobs.qsize(), "queue_capacity": self.jobs.maxsize,
                     "active_job": self.active, "completed": self.completed, "failed": self.failed,

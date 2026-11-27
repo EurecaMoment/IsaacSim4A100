@@ -1,0 +1,118 @@
+"""SimulationService 实现：通过 JobManager 暴露完整 gRPC 契约。"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import grpc
+
+from . import codec, job_manager, rpc
+
+pb = rpc.simulation_pb2
+pb_grpc = rpc.simulation_pb2_grpc
+
+JOB_ID = re.compile(r"^[a-f0-9]{32}$")
+
+
+def _valid_job_id(job_id: str, context) -> str:
+    job_id = (job_id or "").strip()
+    if not JOB_ID.fullmatch(job_id):
+        context.abort(grpc.StatusCode.INVALID_ARGUMENT,
+                      "job_id 必须是 32 位小写十六进制字符串")
+    return job_id
+
+
+class SimulationServicer(pb_grpc.SimulationServiceServicer):
+    """把 JobManager 映射成 gRPC 方法。"""
+
+    def __init__(self, manager: job_manager.JobManager) -> None:
+        self._manager = manager
+
+    # ------------------------------------------------------------------
+    def Health(self, request: pb.HealthRequest, context) -> pb.HealthResponse:
+        try:
+            record = self._manager.health()
+        except Exception as exc:  # noqa: BLE001
+            context.abort(grpc.StatusCode.INTERNAL, f"健康检查失败: {exc}")
+        return codec.health_to_proto(record)
+
+    # ------------------------------------------------------------------
+    def SubmitJob(self, request: pb.SubmitJobRequest, context) -> pb.JobHandle:
+        payload = codec.simulate_request_to_payload(request.simulation)
+        try:
+            record = self._manager.submit(request.request_id, payload)
+        except job_manager.IdempotencyConflict as exc:
+            context.abort(grpc.StatusCode.ALREADY_EXISTS, str(exc))
+        except job_manager.DiskFull as exc:
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+        except Exception as exc:  # 上游队列的 queue.Full / RuntimeError / ValueError 等
+            self._abort_submit(exc, context)
+        return codec.job_handle_to_proto(record)
+
+    @staticmethod
+    def _abort_submit(exc: Exception, context) -> None:
+        import queue as _q
+
+        if isinstance(exc, _q.Full):
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "GPU 队列已满，任务未提交")
+        if isinstance(exc, RuntimeError):
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+        if isinstance(exc, (ValueError, TypeError, KeyError)):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+        context.abort(grpc.StatusCode.INTERNAL, f"提交失败: {exc}")
+
+    # ------------------------------------------------------------------
+    def GetJob(self, request: pb.GetJobRequest, context) -> pb.Job:
+        job_id = _valid_job_id(request.job_id, context)
+        record = self._manager.status(job_id)
+        if record is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"任务不存在: {job_id}")
+        return codec.job_to_proto(record)
+
+    # ------------------------------------------------------------------
+    def DownloadArtifact(self, request: pb.DownloadArtifactRequest, context):
+        try:
+            handle = self._manager.download_open(
+                request.job_id, request.artifact_id, request.offset, request.chunk_bytes
+            )
+        except job_manager.ArtifactReleased as exc:
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except job_manager.ArtifactNotFound as exc:
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except job_manager.JobNotReady as exc:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        except job_manager.OutOfRange as exc:
+            context.abort(grpc.StatusCode.OUT_OF_RANGE, str(exc))
+        except job_manager.TooManyStreams as exc:
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+        for offset, data in self._manager.stream_chunks(handle):
+            yield pb.DownloadChunk(offset=offset, data=data)
+
+    # ------------------------------------------------------------------
+    def AckJob(self, request: pb.AckJobRequest, context) -> pb.AckJobResponse:
+        job_id = _valid_job_id(request.job_id, context)
+        try:
+            result = self._manager.ack(job_id)
+        except job_manager.ArtifactNotFound as exc:
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        return pb.AckJobResponse(
+            released=bool(result["released"]),
+            freed_bytes=int(result["freed_bytes"]),
+        )
+
+    # ------------------------------------------------------------------
+    def CancelJob(self, request: pb.GetJobRequest, context) -> pb.Job:
+        job_id = _valid_job_id(request.job_id, context)
+        record = self._manager.cancel(job_id)
+        if record is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"任务不存在: {job_id}")
+        return codec.job_to_proto(record)
+
+    # ------------------------------------------------------------------
+    def WatchJob(self, request: pb.GetJobRequest, context):
+        job_id = _valid_job_id(request.job_id, context)
+        if self._manager.status(job_id) is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"任务不存在: {job_id}")
+        for record in self._manager.watch_iter(job_id, context.is_active):
+            yield codec.job_to_proto(record)

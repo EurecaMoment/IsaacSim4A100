@@ -71,7 +71,7 @@ def create_app():
 
 
 class Physics:
-    def __init__(self, stage):
+    def __init__(self, stage, device=0):
         import carb
         import omni.physics.tensors as tensors
         import omni.physx
@@ -90,7 +90,7 @@ class Physics:
             settings.CreateEnableGPUDynamicsAttr(True)
             settings.CreateBroadphaseTypeAttr("GPU")
         settings = carb.settings.get_settings()
-        settings.set("/physics/cudaDevice", 0)
+        settings.set("/physics/cudaDevice", device)
         settings.set("/physics/suppressReadback", True)
         settings.set("/physics/updateToUsd", True)
         self.physx = omni.physx.get_physx_interface()
