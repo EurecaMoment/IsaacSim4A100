@@ -212,7 +212,7 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
     # Bound temporary wavefront storage on CPU while retaining the requested
     # total sample count. Mitsuba accumulates all passes into the same film.
     if render_backend == "llvm_ad_rgb":
-        film_pixels = size * size * (len(cameras) if cameras is not None and not individual_views else 1)
+        film_pixels = size * size * (len(cameras) if cameras is not None else 1)
         max_pass_spp = max(1, (4 * 1024 * 1024) // film_pixels)
         if spp > max_pass_spp:
             scene["integrator"]["samples_per_pass"] = next(

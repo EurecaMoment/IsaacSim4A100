@@ -194,7 +194,7 @@ class PhysicsQueue(JobQueue):
             result["capture_frames"] = prepare_capture(value["capture"], steps)["frames"]
         return result
 
-    def frame_artifacts(self, render, image):
+    def frame_artifacts(self, render, image, point):
         import numpy as np
 
         views = {}
@@ -217,6 +217,21 @@ class PhysicsQueue(JobQueue):
                         np.save(path, arrays[source])
                         row[key] = str(path)
                 row["semantic_labels"] = annotation["labels"]
+                labels = {key: value["prim_path"] for key, value in annotation["instances"].items()}
+                persist(destination / "instance_labels.json", {"idToLabels": labels})
+                row["instance_labels"] = str(destination / "instance_labels.json")
+            if "view_id" in frame:
+                size = frame["resolution"][0]
+                angle = frame["fov_degrees"]
+                focal = size / (2 * np.tan(np.deg2rad(angle) / 2))
+                calibration = {"K": [[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1]],
+                               "usd_camera_to_world": frame["camera_world"], "fov_y_degrees": angle,
+                               "id": frame["view_id"], "width": size, "height": size, "frame": point}
+                persist(destination / "camera.json", calibration)
+                row["camera"] = str(destination / "camera.json")
+                persist(destination / "annotations.json", {"view_id": frame["view_id"], "frame": point,
+                        "state": "../../state.npz", "depth_convention": "metric camera-forward distance"})
+                row["annotations"] = str(destination / "annotations.json")
             views[frame.get("view_id", str(index))] = row
         return {**next(iter(views.values())), "views": views}
 
@@ -384,8 +399,15 @@ class PhysicsQueue(JobQueue):
                 if capture:
                     image = folder / "render.png"
                     render = self.capture_scene(stage, capture, image)
-                    frame.update(self.frame_artifacts(render, image))
+                    frame.update(self.frame_artifacts(render, image, point))
                 frames.append(frame)
+                if self.active == directory.name:
+                    with self.changed:
+                        record = self.status(directory.name)
+                        record.update(phase="rendering" if capture else "simulating",
+                                      frames_done=len(frames), frames_total=len(request.get("capture_frames", [point])))
+                        persist(directory / "job.json", record)
+                        self.changed.notify_all()
             if folder != directory:
                 np.savez(directory / "state.npz", poses_xyzw=poses, velocities=velocities)
             result = {"isaac_sim": self.runtime_version, "physics_device": physics_device,

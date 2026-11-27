@@ -213,7 +213,7 @@ def start_http(state, host, port, submit_route):
                         value = state.status(job_id)
                         if value and value["state"] in {"queued", "running"} and wait_ms:
                             state.changed.wait_for(
-                                lambda: state.status(job_id)["state"] not in {"queued", "running"},
+                                  lambda: state.status(job_id) != value,
                                 timeout=wait_ms / 1000,
                             )
                             value = state.status(job_id)
