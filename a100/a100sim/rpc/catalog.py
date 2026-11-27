@@ -89,6 +89,14 @@ DOMAINS = (
                 "New independent scene per request; cube/sphere/prepared mesh, 1–256 bodies. No interactive editor.",
             ),
             implemented(
+                "preview",
+                "Persistent scene fast RGB preview",
+                "extension",
+                "Returns a versioned PNG artifact from the configured private preview worker.",
+                fixed={"operation": "scene.preview"},
+                historical=False,
+            ),
+            implemented(
                 "random_layout",
                 "可复现的随机场景布局",
                 "randomize",
@@ -1002,8 +1010,12 @@ def build_catalog(capabilities: list[pb.Capability]) -> pb.ApiCatalog:
     catalog.CopyFrom(_catalog_template())
     for domain in catalog.domains:
         for feature in domain.features:
-            if feature.task_field and (
-                feature.task_field not in live or live[feature.task_field].availability != pb.AVAILABLE
+            capability_name = feature.task_field
+            if capability_name == "extension":
+                fixed_arguments = MessageToDict(feature.fixed_arguments, preserving_proto_field_name=True)
+                capability_name = "extension." + fixed_arguments.get("operation", "")
+            if capability_name and (
+                capability_name not in live or live[capability_name].availability != pb.AVAILABLE
             ):
                 feature.availability = pb.UNAVAILABLE
                 feature.reason += " Required worker/workflow is not ready."

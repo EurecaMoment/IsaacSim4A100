@@ -124,7 +124,7 @@ class JobManager:
             created_at_unix=record["created_at_unix"],
         )
 
-    async def submit(self, request: pb.SubmitTaskRequest) -> pb.Job:
+    async def submit(self, request: pb.SubmitTaskRequest, *, snapshot_artifacts: bool = False) -> pb.Job:
         """Atomically deduplicate, persist and enqueue one request."""
         if not self.accepting:
             raise ServiceError(grpc.StatusCode.UNAVAILABLE, "Gateway is stopping")
@@ -132,13 +132,15 @@ class JobManager:
         identity_message.CopyFrom(request)
         identity_message.ClearField("request_id")
         digest = hashlib.sha256(identity_message.SerializeToString(deterministic=True)).hexdigest()
-        return self._admit(request.request_id, digest, lambda: decode(request, self.assets))
+        return self._admit(
+            request.request_id, digest, lambda: decode(request, self.assets), snapshot_artifacts=snapshot_artifacts
+        )
 
     def submit_simulation(self, request_id, simulation, decode_simulation):
         digest = hashlib.sha256(b"isaacsim_rpc.v1\0" + simulation.SerializeToString(deterministic=True)).hexdigest()
         return self._admit(request_id, digest, decode_simulation, unified=True)
 
-    def _admit(self, request_id, digest, decode_task, *, unified=False):
+    def _admit(self, request_id, digest, decode_task, *, unified=False, snapshot_artifacts=False):
         if not self.accepting:
             raise ServiceError(grpc.StatusCode.UNAVAILABLE, "Gateway is stopping")
         if not request_id.strip() or len(request_id) > 128:
@@ -164,6 +166,7 @@ class JobManager:
             "revision": 1,
             "created_at_unix": time.time(),
             "unified": unified,
+            "snapshot_artifacts": snapshot_artifacts,
         }
         self._persist(record)
         self.records[identity] = record
@@ -207,14 +210,15 @@ class JobManager:
             return
         completed = sorted(
             (item for item in self.records.values() if item["state"] in TERMINAL
-             and (not item.get("unified") or item.get("released") or item["state"] != "SUCCEEDED")
+             and (not (item.get("unified") or item.get("snapshot_artifacts"))
+                  or item.get("released") or item["state"] != "SUCCEEDED")
              and not self.downloads.get(item["job_id"])),
             key=lambda item: item["created_at_unix"],
         )
         if not completed:
             raise ServiceError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Retained job capacity is occupied")
         for record in completed[: max(1, len(completed) // 4)]:
-            if record.get("unified"):
+            if record.get("unified") or record.get("snapshot_artifacts"):
                 self.release_artifacts(record)
             self.records.pop(record["job_id"])
             self.request_ids.pop(record["request_id"])
@@ -259,7 +263,7 @@ class JobManager:
                         continue
                     self._update(record, phase="writing_artifacts")
                     self.changed.notify_all()
-                if record.get("unified"):
+                if record.get("unified") or record.get("snapshot_artifacts"):
                     cleaned, artifacts = await asyncio.to_thread(
                         self.artifacts.snapshot, result, self.settings.state_root / "downloads" / identity
                     )
@@ -320,7 +324,8 @@ class JobManager:
         while True:
             cutoff = time.time() - self.settings.retention_seconds
             for record in list(self.records.values()):
-                if (record.get("unified") and not record.get("released") and record["state"] in TERMINAL
+                if ((record.get("unified") or record.get("snapshot_artifacts"))
+                        and not record.get("released") and record["state"] in TERMINAL
                         and record.get("finished_at", record["created_at_unix"]) <= cutoff):
                     try:
                         self.release_artifacts(record)

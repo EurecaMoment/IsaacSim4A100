@@ -14,20 +14,15 @@ from pathlib import Path
 from typing import Any
 
 import grpc
-from google.protobuf.empty_pb2 import Empty
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from a100sim.rpc.backend import SimulatorBackend
-from a100sim.rpc.catalog import API_VERSION, SIMULATOR_VERSION, build_catalog, resolve_feature
 from a100sim.rpc.config import Settings
 from a100sim.rpc.errors import ServiceError
 from a100sim.rpc.jobs import JobManager
-from a100sim.rpc.v1 import simulator_pb2 as pb
-from a100sim.rpc.v1 import simulator_pb2_grpc as rpc
 
 LOGGER = logging.getLogger(__name__)
-SERVICE_NAME = "a100sim.v1.Simulator"
 
 
 @asynccontextmanager
@@ -80,101 +75,6 @@ class TokenInterceptor(grpc.aio.ServerInterceptor):
         return handler._replace(**{key: deny_stream if handler.response_streaming else deny})
 
 
-class SimulatorService(rpc.SimulatorServicer):
-    """Implement the simulator-side API independently of client orchestration."""
-
-    def __init__(self, manager: JobManager) -> None:
-        self.manager = manager
-
-    async def GetCapabilities(self, request: Empty, context: grpc.aio.ServicerContext) -> pb.Capabilities:
-        """Return live simulator availability and explicit unsupported functionality."""
-        async with handle_errors(context):
-            capabilities = await self.manager.backend.describe()
-            return pb.Capabilities(
-                api_version=API_VERSION,
-                simulator_version=SIMULATOR_VERSION,
-                capabilities=capabilities,
-                queue_capacity=self.manager.settings.capacity,
-                queued_jobs=self.manager.queue.qsize(),
-                running_jobs=sum(r["state"] == "RUNNING" for r in self.manager.records.values()),
-            )
-
-    async def GetApiCatalog(self, request: Empty, context: grpc.aio.ServicerContext) -> pb.ApiCatalog:
-        """Return all 30 domains, argument schemas, implementation gaps and live readiness."""
-        async with handle_errors(context):
-            return build_catalog(await self.manager.backend.describe())
-
-    async def InvokeFeature(self, request: pb.FeatureRequest, context: grpc.aio.ServicerContext) -> pb.Job:
-        """Resolve a catalog ID to a real typed task or reject an unimplemented feature."""
-        async with handle_errors(context):
-            return await self.manager.submit(resolve_feature(request))
-
-    async def SubmitTask(self, request: pb.SubmitTaskRequest, context: grpc.aio.ServicerContext) -> pb.Job:
-        """Accept a durable task once; caller deadlines do not revoke accepted work."""
-        async with handle_errors(context):
-            return await self.manager.submit(request)
-
-    async def GetJob(self, request: pb.JobRequest, context: grpc.aio.ServicerContext) -> pb.Job:
-        """Return a retained job snapshot."""
-        async with handle_errors(context):
-            return self.manager.encode(self.manager.get_record(request.job_id))
-
-    async def WatchJob(self, request: pb.WatchJobRequest, context: grpc.aio.ServicerContext) -> AsyncIterator[pb.Job]:
-        """Stream revision changes until the task reaches a terminal state."""
-        async with handle_errors(context):
-            async for job in self.manager.observe(request.job_id, request.after_revision):
-                yield job
-
-    async def CancelJob(self, request: pb.JobRequest, context: grpc.aio.ServicerContext) -> pb.Job:
-        """Cancel a task only while it is still queued inside the gateway."""
-        async with handle_errors(context):
-            return await self.manager.cancel(request.job_id)
-
-    async def RunTasks(
-        self, requests: AsyncIterator[pb.SubmitTaskRequest], context: grpc.aio.ServicerContext
-    ) -> AsyncIterator[pb.Job]:
-        """Execute an ordered control stream with one task in flight per stream."""
-        async with handle_errors(context):
-            async for request in requests:
-                accepted = await self.manager.submit(request)
-                latest = accepted
-                async for snapshot in self.manager.observe(accepted.job_id):
-                    latest = snapshot
-                yield latest
-
-    async def ListAssets(self, request: Empty, context: grpc.aio.ServicerContext) -> pb.AssetList:
-        """List handles that can be referenced by simulation or import requests."""
-        async with handle_errors(context):
-            return await asyncio.to_thread(self.manager.assets.list_assets)
-
-    async def UploadAsset(
-        self, requests: AsyncIterator[pb.UploadChunk], context: grpc.aio.ServicerContext
-    ) -> pb.AssetFile:
-        """Publish one immutable asset file with stream flow control and SHA-256 validation."""
-        async with handle_errors(context):
-            return await self.manager.assets.upload(requests)
-
-    async def DownloadArtifact(
-        self, request: pb.DownloadRequest, context: grpc.aio.ServicerContext
-    ) -> AsyncIterator[pb.DownloadChunk]:
-        """Stream only artifacts belonging to the requested job with optional resume."""
-        async with handle_errors(context):
-            record = self.manager.get_record(request.job_id)
-            item = next(
-                (item for item in record.get("artifacts", []) if item["artifact_id"] == request.artifact_id), None
-            )
-            if item is None:
-                raise ServiceError(grpc.StatusCode.NOT_FOUND, "Artifact does not belong to this job")
-            chunk_size = request.chunk_bytes if request.HasField("chunk_bytes") else 256 * 1024
-            if not 1 <= chunk_size <= 1024 * 1024 or request.offset > item["size_bytes"]:
-                raise ValueError("Chunk size must be 1 byte–1 MiB and offset must not exceed file size")
-            path = self.manager.artifacts.validate(item["path"])
-            with path.open("rb") as stream:
-                stream.seek(request.offset)
-                offset = request.offset
-                while block := await asyncio.to_thread(stream.read, chunk_size):
-                    yield pb.DownloadChunk(offset=offset, data=block)
-                    offset += len(block)
 
 
 def build_server(
@@ -195,14 +95,12 @@ def build_server(
     )
     from a100sim.rpc.unified import SERVICE, UnifiedService, rpc as shared_rpc
 
-    rpc.add_SimulatorServicer_to_server(SimulatorService(manager), server)
     shared_rpc.simulation_pb2_grpc.add_SimulationServiceServicer_to_server(UnifiedService(manager, handle_errors), server)
     checker = health.HealthServicer()
     checker.set("", health_pb2.HealthCheckResponse.SERVING)
-    checker.set(SERVICE_NAME, health_pb2.HealthCheckResponse.SERVING)
     checker.set(SERVICE, health_pb2.HealthCheckResponse.SERVING)
     health_pb2_grpc.add_HealthServicer_to_server(checker, server)
-    reflection.enable_server_reflection((SERVICE_NAME, SERVICE, health.SERVICE_NAME, reflection.SERVICE_NAME), server)
+    reflection.enable_server_reflection((SERVICE, health.SERVICE_NAME, reflection.SERVICE_NAME), server)
     port = (
         server.add_secure_port(listen, grpc.ssl_server_credentials(((private_key, certificate),)))
         if certificate

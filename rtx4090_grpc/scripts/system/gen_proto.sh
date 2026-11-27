@@ -17,6 +17,7 @@ mkdir -p "$root/generated"
     --python_out="$root/generated" \
     --grpc_python_out="$root/generated" \
     --pyi_out="$root/generated" \
+    "$root/proto/isaacsim_rpc/v1/native.proto" \
     "$root/proto/isaacsim_rpc/v1/simulation.proto"
 
 echo "已生成："

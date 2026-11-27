@@ -35,7 +35,7 @@ def wait_for_grpc(target: str, timeout: float) -> None:
         while time.monotonic() < deadline:
             try:
                 value = client.Check(
-                    health_pb2.HealthCheckRequest(service="a100sim.v1.Simulator"),
+                    health_pb2.HealthCheckRequest(service="isaacsim_rpc.v1.SimulationService"),
                     metadata=metadata,
                     timeout=min(3, max(0.01, deadline - time.monotonic())),
                 )

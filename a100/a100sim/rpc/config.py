@@ -18,6 +18,7 @@ class Settings:
     artifact_roots: tuple[Path, ...]
     backend_urls: dict[str, str]
     code_root: Path
+    preview_url: str = ""
     listen: str = "127.0.0.1:50051"
     capacity: int = 64
     workers: int = 32
@@ -56,6 +57,7 @@ class Settings:
             artifact_roots=(runtime / "results", local / "jobs", features / "reports", state / "workflows"),
             backend_urls=urls,
             code_root=code,
+            preview_url=os.environ.get("A100SIM_PREVIEW_URL", "").strip(),
             listen=os.environ.get("A100SIM_GRPC_LISTEN") or "127.0.0.1:50051",
             capacity=int(os.environ.get("A100SIM_GRPC_CAPACITY") or 64),
             workers=int(os.environ.get("A100SIM_GRPC_WORKERS") or 32),
@@ -75,3 +77,5 @@ class Settings:
             raise ValueError("Retention must be positive and minimum free space cannot be negative")
         for value in self.backend_urls.values():
             require_worker_url(value)
+        if self.preview_url:
+            require_worker_url(self.preview_url)

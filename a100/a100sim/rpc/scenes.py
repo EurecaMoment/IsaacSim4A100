@@ -7,10 +7,16 @@ by the same AssetStore as UploadAsset; requests never contain executable code.
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
+import re
+import struct
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import grpc
 from a100sim.network import require_worker_url
@@ -27,6 +33,20 @@ POLL_TIMEOUT_SECONDS = 5
 TRANSIENT_OBSERVATION_CODES = frozenset(
     {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.RESOURCE_EXHAUSTED}
 )
+PREVIEW_OPERATION = "scene.preview"
+PREVIEW_MAX_BYTES = 16 * 1024 * 1024
+PREVIEW_PARAMETER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+        "camera": {"type": "string", "pattern": "^/", "description": "Authored absolute camera prim path."},
+        "size": {"type": "integer", "minimum": 64, "maximum": 1024, "default": 1024},
+        "spp": {"type": "integer", "minimum": 1, "maximum": 4, "default": 4},
+        "version": {"type": "string", "description": "Optional expected stage version."},
+    },
+    "required": ["session_id", "camera"],
+    "additionalProperties": False,
+}
 
 
 class SceneBackend(SimulatorBackend):
@@ -42,6 +62,27 @@ class SceneBackend(SimulatorBackend):
                 return await self.scene_task(operation, arguments, directory)
 
             self.register(name, RegisteredOperation(handler, scope, PARAMETER_SCHEMAS[name]))
+        if settings.preview_url:
+            self.register(
+                PREVIEW_OPERATION,
+                RegisteredOperation(self.preview_task, "read_only", PREVIEW_PARAMETER_SCHEMA),
+            )
+
+    async def health(self) -> dict[str, dict[str, Any]]:
+        """Include the separately hosted preview worker in live capability checks."""
+        workers = await super().health()
+        if self.settings.preview_url:
+            try:
+                async with self.session.get(self.settings.preview_url + "/health", timeout=2) as response:
+                    payload = await response.json(content_type=None)
+                ready = response.status == 200 and payload.get("status") == "ok"
+                workers["preview"] = {
+                    "status": "ready" if ready else "unavailable",
+                    "reason": "" if ready else "The preview worker is not ready",
+                }
+            except (OSError, asyncio.TimeoutError, ValueError, TypeError):
+                workers["preview"] = {"status": "unavailable", "reason": "The preview worker is not ready"}
+        return workers
 
     async def describe(self) -> list[pb.Capability]:
         """Advertise scene operations only when their independent worker is ready."""
@@ -52,7 +93,86 @@ class SceneBackend(SimulatorBackend):
             if item.name.removeprefix("extension.") in OPERATIONS:
                 item.availability = pb.AVAILABLE if ready else pb.UNAVAILABLE
                 item.reason = "" if ready else worker.get("reason", "The scene worker is not ready")
+            elif item.name == "extension." + PREVIEW_OPERATION:
+                ready = worker.get("preview", {}).get("status") == "ready"
+                item.availability = pb.AVAILABLE if ready else pb.UNAVAILABLE
+                item.reason = (
+                    "" if ready else worker.get("preview", {}).get("reason", "The preview worker is not ready")
+                )
         return capabilities
+
+    async def preview_task(self, arguments: dict[str, Any], directory: Path) -> dict[str, Any]:
+        """Render and retain one versioned PNG through the private preview worker."""
+        if not self.settings.preview_url:
+            raise ServiceError(grpc.StatusCode.UNIMPLEMENTED, "The preview worker is not configured")
+        session_id = arguments.get("session_id")
+        camera = arguments.get("camera")
+        if not isinstance(session_id, str) or not re.fullmatch(r"[a-f0-9]{32}", session_id):
+            raise ValueError("session_id must be 32 lower-case hexadecimal characters")
+        if not isinstance(camera, str) or not camera.startswith("/"):
+            raise ValueError("camera must be an authored absolute prim path")
+        payload = {"session_id": session_id, "camera": camera}
+        for name, default, minimum, maximum in (("size", 1024, 64, 1024), ("spp", 4, 1, 4)):
+            value = arguments.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be an integer")
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(f"{name} must be an integer")
+            integer = int(value)
+            if not minimum <= integer <= maximum:
+                raise ValueError(f"{name} must be between {minimum} and {maximum}")
+            payload[name] = integer
+        if "version" in arguments:
+            version = arguments["version"]
+            if not isinstance(version, str) or not version:
+                raise ValueError("version must be a nonempty string")
+            payload["version"] = version
+        request = Request(
+            self.settings.preview_url + "/v1/preview",
+            json.dumps(payload, allow_nan=False).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        try:
+            response = await asyncio.to_thread(urlopen, request, timeout=120)
+        except HTTPError as error:
+            code, message = {
+                400: (grpc.StatusCode.INVALID_ARGUMENT, "Invalid preview request"),
+                404: (grpc.StatusCode.NOT_FOUND, "Preview scene session was not found"),
+                409: (grpc.StatusCode.ABORTED, "Preview scene changed while rendering"),
+                503: (grpc.StatusCode.RESOURCE_EXHAUSTED, "Preview worker is at capacity"),
+            }.get(error.code, (grpc.StatusCode.INTERNAL, "Preview rendering failed"))
+            raise ServiceError(code, message) from error
+        except (TimeoutError, URLError, OSError) as error:
+            raise ServiceError(grpc.StatusCode.UNAVAILABLE, "Preview worker did not respond") from error
+
+        with response:
+            if response.headers.get_content_type() != "image/png":
+                raise ServiceError(grpc.StatusCode.INTERNAL, "Preview worker returned an unexpected media type")
+            version = response.headers.get("X-Scene-Version", "")
+            if not version:
+                raise ServiceError(grpc.StatusCode.INTERNAL, "Preview worker returned an unversioned image")
+            image = response.read(PREVIEW_MAX_BYTES + 1)
+        if (
+            len(image) > PREVIEW_MAX_BYTES
+            or len(image) < 33
+            or image[:8] != b"\x89PNG\r\n\x1a\n"
+            or struct.unpack(">II", image[16:24]) != (payload["size"],) * 2
+            or image[-8:-4] != b"IEND"
+        ):
+            raise ServiceError(grpc.StatusCode.INTERNAL, "Preview worker returned an incomplete or mismatched PNG")
+
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "scene-preview.png"
+        temporary = directory / ".scene-preview.png.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(image)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"image": str(path), "scene_version": version, "media_type": "image/png"}
 
     async def scene_task(self, operation: str, arguments: dict[str, Any], directory: Path) -> dict[str, Any]:
         """Resolve uploaded assets and await exactly one accepted worker job."""
