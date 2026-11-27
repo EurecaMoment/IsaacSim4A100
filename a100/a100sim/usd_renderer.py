@@ -235,7 +235,7 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
             sensor = {**scene["sensor"], "fov": angle, "to_world": mi.ScalarTransform4f.look_at(
                 origin=matrix[:3, 3], target=matrix[:3, 3] - matrix[:3, 2], up=matrix[:3, 1])}
             camera_specs.append((path, matrix, angle, sensor))
-        if not individual_views:
+        if not individual_views or len(camera_specs) > 1:
             batch = {"type": "batch", "film": {**scene["sensor"]["film"], "width": size * len(cameras)}}
             for index, (_, _, _, sensor) in enumerate(camera_specs):
                 batch[f"camera_{index:04d}"] = {key: value for key, value in sensor.items() if key != "film"}
@@ -280,7 +280,7 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
         }
 
     output = Path(output)
-    if individual_views:
+    if individual_views and len(camera_specs) == 1:
         frames = []
         for index, (path, matrix, angle, config) in enumerate(camera_specs):
             sensor = scene.sensors()[0] if index == 0 else mi.load_dict(config)
@@ -304,7 +304,7 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
         frames = []
         annotation_seconds = 0.0
         for index, (path, matrix, angle, sensor_config) in enumerate(camera_specs):
-            destination = output / f"camera-{index:03d}.png"
+            destination = output / (f"view_{index}.png" if individual_views else f"camera-{index:03d}.png")
             mi.util.write_bitmap(str(destination), pixels[:, index * size:(index + 1) * size], write_async=False)
             annotation_result = None
             if annotations:
@@ -314,7 +314,8 @@ def render_stage(stage, camera_path, mode, output, size=512, spp=64, seed=42, ga
                     scene, stage, sources, matrix, destination.with_suffix(""),
                     sensor=mi.load_dict(sensor_config), surface_ids=surface_ids)
                 annotation_seconds += time.perf_counter() - tick
-            frames.append({"image": str(destination), "camera": path, "camera_world": matrix.tolist(),
+            frames.append({"image": destination.name if individual_views else str(destination),
+                           "camera": path, "camera_world": matrix.tolist(),
                            "fov_degrees": angle, "resolution": [size, size], "spp": spp,
                            "mode": mode, "native_rtx": False, "cpu_fallback": cpu_fallback,
                            "render_backend": render_backend,

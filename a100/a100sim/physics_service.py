@@ -37,13 +37,22 @@ class PhysicsQueue(JobQueue):
         """Render with the default A100 Mitsuba backend."""
         from .usd_renderer import render_stage
 
+        if capture.get("views"):
+            cameras = [f"/World/View_{i}" for i in range(len(capture["views"]))]
+            result = render_stage(stage, cameras[0], "mesh", image.parent, cameras=cameras,
+                                  size=capture["size"], spp=capture["spp"], seed=capture["seed"],
+                                  annotations=True)
+            for view, frame in zip(capture["views"], result["frames"]):
+                frame["view_id"] = view["id"]
+            return result
+
         return render_stage(stage, "/World/Camera", capture["kind"], image,
                             size=capture["size"], spp=capture["spp"], seed=capture["seed"],
                             gaussian_gain=float(capture.get("gaussian_gain", 1.0)),
                             annotations=capture.get("annotations", False))
 
     def prepare(self, value):
-        unknown = set(value) - {"bodies", "steps", "dt", "gravity", "ground", "render"}
+        unknown = set(value) - {"bodies", "steps", "dt", "gravity", "ground", "render", "capture"}
         if unknown:
             raise ValueError("Unsupported simulation fields: " + ", ".join(sorted(unknown)))
         bodies = value.get("bodies")
@@ -72,7 +81,7 @@ class PhysicsQueue(JobQueue):
                     "position": vector(body.get("position", [0, 0, 2]), "position"),
                     "orientation_xyzw": vector(body.get("orientation_xyzw", [0, 0, 0, 1]),
                                                "orientation_xyzw", 4, -1, 1),
-                    "mass": finite(body.get("mass", 1), "mass", .0001, 100000),
+                    "mass": finite(body.get("mass", 1), "mass", 0, 100000),
                     "color": vector(body.get("color", [.35, .5, .7]), "color", 3, 0, 1)}
             q = item["orientation_xyzw"]
             norm = sum(x * x for x in q) ** .5
@@ -104,7 +113,7 @@ class PhysicsQueue(JobQueue):
             if not isinstance(render, dict):
                 raise ValueError("render must be an object")
             extra = set(render) - {"kind", "size", "spp", "seed", "azimuth",
-                                  "elevation", "distance", "target", "lighting", "gaussian_gain", "annotations"}
+                                  "elevation", "distance", "target", "lighting", "gaussian_gain", "annotations", "views"}
             if extra:
                 raise ValueError("Unsupported render fields: " + ", ".join(sorted(extra)))
             if render.get("kind", "mesh") not in {"mesh", "gaussian"}:
@@ -156,8 +165,8 @@ class PhysicsQueue(JobQueue):
                         if field in spec:
                             vector(spec[field], "lighting.fill.target")
             render = {"kind": render.get("kind", "mesh"),
-                      "size": integer(render.get("size", 256), "render.size", 64, 1024),
-                      "spp": integer(render.get("spp", 8), "render.spp", 1, 256),
+                      "size": integer(render.get("size", 256), "render.size", 64, 2048),
+                      "spp": integer(render.get("spp", 8), "render.spp", 1, 1024),
                       "seed": integer(render.get("seed", 42), "render.seed", 0, 2147483647),
                       "azimuth": finite(render.get("azimuth", 35), "azimuth", -36000, 36000),
                       "elevation": finite(render.get("elevation", 20), "elevation", -80, 80),
@@ -168,12 +177,48 @@ class PhysicsQueue(JobQueue):
                       "annotations": render.get("annotations", False)}
             if lighting is not None:
                 render["lighting"] = lighting
+            if "views" in value["render"]:
+                from .views import camera_views
+                render["views"] = camera_views(value["render"]["views"])
         if not isinstance(value.get("ground", True), bool):
             raise ValueError("ground must be boolean")
-        return {"bodies": normalized, "steps": integer(value.get("steps", 240), "steps", 1, 1200),
+        steps = integer(value.get("steps", 240), "steps", 1, 1200)
+        result = {"bodies": normalized, "steps": steps,
                 "dt": finite(value.get("dt", 1 / 120), "dt", .0001, .02),
                 "gravity": finite(value.get("gravity", 9.81), "gravity", 0, 100),
                 "ground": value.get("ground", True), "render": render}
+        if "capture" in value:
+            from .views import prepare_capture
+            if not render:
+                raise ValueError("capture requires render")
+            result["capture_frames"] = prepare_capture(value["capture"], steps)["frames"]
+        return result
+
+    def frame_artifacts(self, render, image):
+        import numpy as np
+
+        views = {}
+        for index, frame in enumerate(render.get("frames") or [render]):
+            picture = Path(frame.get("image") or image)
+            if not picture.is_absolute():
+                picture = image.parent / picture
+            destination = image.parent
+            if "view_id" in frame:
+                destination = destination / "views" / frame["view_id"]
+                destination.mkdir(parents=True, exist_ok=True)
+                picture = picture.replace(destination / "render.png")
+            row = {"image": str(picture)}
+            annotation = frame.get("annotations")
+            if annotation:
+                with np.load(annotation["arrays"], allow_pickle=False) as arrays:
+                    for source, key in (("depth_m", "depth_m"), ("semantic_id", "semantic_ids"),
+                                        ("instance_id", "instance_ids")):
+                        path = destination / f"{key}.npy"
+                        np.save(path, arrays[source])
+                        row[key] = str(path)
+                row["semantic_labels"] = annotation["labels"]
+            views[frame.get("view_id", str(index))] = row
+        return {**next(iter(views.values())), "views": views}
 
     def process(self, request, directory):
         import numpy as np
@@ -207,8 +252,11 @@ class PhysicsQueue(JobQueue):
             if "semantic_label" in body:
                 root.GetPrim().CreateAttribute("a100sim:semanticLabel", Sdf.ValueTypeNames.String).Set(
                     body["semantic_label"])
-            UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
-            UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(body["mass"])
+            rigid = UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+            if body["mass"] == 0:
+                rigid.CreateKinematicEnabledAttr(True)
+            else:
+                UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(body["mass"])
             visual_path = path + "/Visual"
             channels = {}
             if body["shape"] == "mesh":
@@ -250,36 +298,7 @@ class PhysicsQueue(JobQueue):
                 raise RuntimeError(f"Expected {len(paths)} GPU rigid bodies; found {rigids.count}")
             setup_seconds = time.perf_counter() - started
             tick = time.perf_counter()
-            physics.step(request["steps"], request["dt"])
-            physics_seconds = time.perf_counter() - tick
-            poses = rigids.get_transforms().numpy().copy()
-            velocities = rigids.get_velocities().numpy().copy()
-            actual_paths = paths
-            bodies = []
-            by_path = {path: body for path, body in zip(paths, request["bodies"])}
-            for path, pose, velocity in zip(actual_paths, poses, velocities):
-                position = Gf.Vec3d(*[float(v) for v in pose[:3]])
-                qx, qy, qz, qw = [float(v) for v in pose[3:7]]
-                matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(qw, Gf.Vec3d(qx, qy, qz)))
-                matrix.SetTranslateOnly(position)
-                xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-                xform.ClearXformOpOrder()
-                xform.AddTransformOp().Set(matrix)
-                bodies.append({"id": by_path[path]["id"], "prim_path": path,
-                               "pose_xyzw": pose.tolist(), "velocity": velocity.tolist()})
-            np.savez(directory / "state.npz", poses_xyzw=poses, velocities=velocities)
-            result = {"isaac_sim": self.runtime_version, "physics_device": str(physics.view.device),
-                      "physical_gpu": self.health()["physical_gpu"], "native_rtx": self.native_rtx,
-                      "cpu_fallback": False, "bodies": bodies, "rigid_bodies": len(bodies),
-                      "steps": request["steps"], "dt": request["dt"],
-                      "simulation_seconds": request["steps"] * request["dt"],
-                      "setup_seconds": setup_seconds, "physics_seconds": physics_seconds,
-                      "state_npz": str(directory / "state.npz"),
-                      "collision": "PhysX primitives; convexHull for dynamic mesh",
-                      "scene": str(directory / "scene.usdc")}
-            if self.close_physics_before_capture:
-                physics.close()
-                physics = None
+            physics_device = str(physics.view.device)
             capture = request["render"]
             if capture:
                 import math
@@ -322,9 +341,65 @@ class PhysicsQueue(JobQueue):
                         wash.CreateExposureAttr(float(fill["exposure"]))
                     orient(wash.GetPrim(), fill.get("origin", [0, 0, 3]),
                            fill.get("target", [0, 0, 0]))
-                image = directory / "render.png"
-                result["render"] = self.capture_scene(stage, capture, image)
-                result["image"] = str(image)
+
+                for index, view in enumerate(capture.get("views", [])):
+                    selected = UsdGeom.Camera.Define(stage, f"/World/View_{index}")
+                    selected.CreateFocalLengthAttr(35)
+                    selected.CreateHorizontalApertureAttr(70 * math.tan(math.radians(view["fov_y_degrees"]) / 2))
+                    matrix = Gf.Matrix4d().SetLookAt(*[Gf.Vec3d(*view[k]) for k in ("eye", "target", "up")])
+                    selected.AddTransformOp().Set(matrix.GetInverse())
+
+            previous = 0
+            frames = []
+            physics_seconds = 0.0
+            for point in request.get("capture_frames", [request["steps"]]):
+                tick = time.perf_counter()
+                physics.step(point - previous, request["dt"])
+                physics_seconds += time.perf_counter() - tick
+                previous = point
+                poses = rigids.get_transforms().numpy().copy()
+                velocities = rigids.get_velocities().numpy().copy()
+                actual_paths = paths
+                bodies = []
+                by_path = {path: body for path, body in zip(paths, request["bodies"])}
+                for path, pose, velocity in zip(actual_paths, poses, velocities):
+                    position = Gf.Vec3d(*[float(v) for v in pose[:3]])
+                    qx, qy, qz, qw = [float(v) for v in pose[3:7]]
+                    matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(qw, Gf.Vec3d(qx, qy, qz)))
+                    matrix.SetTranslateOnly(position)
+                    xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+                    xform.ClearXformOpOrder()
+                    xform.MakeMatrixXform().Set(matrix)
+                    bodies.append({"id": by_path[path]["id"], "prim_path": path,
+                                   "pose_xyzw": pose.tolist(), "velocity": velocity.tolist()})
+                final = point == request["steps"]
+                if final and self.close_physics_before_capture:
+                    physics.close()
+                    physics = None
+                folder = directory / "frames" / f"frame_{point:06d}" if "capture_frames" in request else directory
+                folder.mkdir(parents=True, exist_ok=True)
+                state_file = folder / "state.npz"
+                np.savez(state_file, poses_xyzw=poses, velocities=velocities)
+                frame = {"frame": point, "state_npz": str(state_file)}
+                if capture:
+                    image = folder / "render.png"
+                    render = self.capture_scene(stage, capture, image)
+                    frame.update(self.frame_artifacts(render, image))
+                frames.append(frame)
+            if folder != directory:
+                np.savez(directory / "state.npz", poses_xyzw=poses, velocities=velocities)
+            result = {"isaac_sim": self.runtime_version, "physics_device": physics_device,
+                      "physical_gpu": self.health()["physical_gpu"], "native_rtx": self.native_rtx,
+                      "cpu_fallback": render.get("cpu_fallback", False) if capture else False,
+                      "bodies": bodies, "rigid_bodies": len(bodies), "steps": request["steps"],
+                      "dt": request["dt"], "simulation_seconds": request["steps"] * request["dt"],
+                      "setup_seconds": setup_seconds, "physics_seconds": physics_seconds,
+                      "state_npz": str(directory / "state.npz"), "scene": str(directory / "scene.usdc"),
+                      "collision": "PhysX primitives; convexHull for dynamic mesh"}
+            if capture:
+                result.update(render=render, **{k: v for k, v in frames[-1].items() if k not in ("frame", "state_npz")})
+            if "capture_frames" in request or (capture and capture.get("views")):
+                result["frames"] = frames
             stage.GetRootLayer().Export(str(directory / "scene.usdc"))
             persist(directory / "simulation.json", result)
             result["simulation_result"] = str(directory / "simulation.json")
