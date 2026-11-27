@@ -7,6 +7,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path, PurePosixPath
@@ -111,6 +112,43 @@ class ArtifactStore:
         if not any(path.is_relative_to(root) for root in self.roots) or not path.is_file():
             raise ServiceError(grpc.StatusCode.PERMISSION_DENIED, "Artifact is outside the configured result roots")
         return path
+
+    def snapshot(self, result: dict[str, Any], directory: Path):
+        """Publish a private, stable copy of a simulation's outputs for transfer and acknowledgement."""
+        cleaned, manifest = self.collect(result)
+        if not manifest:
+            return cleaned, manifest
+        source_root = Path(os.path.commonpath([str(Path(item["path"]).parent) for item in manifest]))
+        # A successful worker also writes camera metadata and sidecars absent from its legacy JSON.
+        if source_root.name == result.get("id"):
+            known = {Path(item["path"]) for item in manifest}
+            for path in sorted(source_root.rglob("*")):
+                if path.is_symlink() or not path.is_file() or path in known or path.name == "job.json":
+                    continue
+                self.validate(str(path))
+                manifest.append({"artifact_id": hashlib.sha256(str(path).encode()).hexdigest()[:32],
+                                 "name": path.name, "path": str(path),
+                                 "media_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"})
+        directory.mkdir(parents=True)
+        try:
+            for item in manifest:
+                path = self.validate(item["path"])
+                relative = path.relative_to(source_root)
+                target = directory / relative
+                target.parent.mkdir(exist_ok=True, parents=True)
+                digest = hashlib.sha256()
+                size = 0
+                with path.open("rb") as source, target.open("xb") as output:
+                    while block := source.read(1024 * 1024):
+                        output.write(block)
+                        digest.update(block)
+                        size += len(block)
+                item.update(path=str(target), relative_path=f"{directory.name}/{relative.as_posix()}",
+                            size_bytes=size, sha256=digest.hexdigest())
+        except BaseException:
+            shutil.rmtree(directory)
+            raise
+        return cleaned, manifest
 
     def collect(self, result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Build a manifest without copying or encoding large binary files in protobuf Structs."""

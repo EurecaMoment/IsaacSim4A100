@@ -25,6 +25,8 @@ class Settings:
     max_upload_bytes: int = 512 * 1024 * 1024
     token: str = ""
     enable_workflows: bool = False
+    retention_seconds: int = 7 * 86400
+    min_free_bytes: int = 2 * 1024**3
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -59,6 +61,8 @@ class Settings:
             workers=int(os.environ.get("A100SIM_GRPC_WORKERS") or 32),
             token=os.environ.get("A100SIM_GRPC_TOKEN") or "",
             enable_workflows=os.environ.get("A100SIM_GRPC_WORKFLOWS", "0") == "1",
+            retention_seconds=int(os.environ.get("GRPC_RETENTION_SECONDS", 7 * 86400)),
+            min_free_bytes=int(os.environ.get("GRPC_MIN_FREE_BYTES", 2 * 1024**3)),
         )
 
     def validate(self) -> None:
@@ -67,5 +71,7 @@ class Settings:
             raise ValueError("Gateway capacity must be 1–4096 and workers must be 1–128")
         if self.retained_jobs < self.capacity + self.workers:
             raise ValueError("Retained job limit must cover queued and running work")
+        if self.retention_seconds < 1 or self.min_free_bytes < 0:
+            raise ValueError("Retention must be positive and minimum free space cannot be negative")
         for value in self.backend_urls.values():
             require_worker_url(value)

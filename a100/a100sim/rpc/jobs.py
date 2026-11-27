@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shutil
 import sqlite3
 import time
 import uuid
@@ -15,7 +16,7 @@ from typing import Any
 import grpc
 from google.protobuf.struct_pb2 import Struct
 
-from a100sim.rpc.backend import TaskBackend
+from a100sim.rpc.backend import TaskBackend, simulation_progress
 from a100sim.rpc.codec import Task, decode
 from a100sim.rpc.config import Settings
 from a100sim.rpc.errors import ServiceError
@@ -47,6 +48,8 @@ class JobManager:
         self.changed = asyncio.Condition()
         self.workers: list[asyncio.Task[None]] = []
         self.accepting = True
+        self.started_at = time.monotonic()
+        self.downloads: dict[str, int] = {}
         for identity, text in self.database.execute("SELECT id, record FROM jobs").fetchall():
             record = json.loads(text)
             if record["state"] not in TERMINAL:
@@ -63,6 +66,7 @@ class JobManager:
         """Open the backend and start bounded dispatch workers."""
         await self.backend.start()
         self.workers = [asyncio.create_task(self._work(), name=f"rpc-worker-{i}") for i in range(self.settings.workers)]
+        self.workers.append(asyncio.create_task(self._expire_artifacts(), name="rpc-artifact-retention"))
 
     async def close(self) -> None:
         """Stop local dispatch and persist interrupted work without retrying upstream effects."""
@@ -113,7 +117,7 @@ class JobManager:
             result=result,
             failure=pb.Failure(**record.get("failure", {})),
             artifacts=[
-                pb.Artifact(**{key: value for key, value in item.items() if key != "path"})
+                pb.Artifact(**{key: item[key] for key in ("artifact_id", "name", "size_bytes", "media_type")})
                 for item in record.get("artifacts", [])
             ],
             timings=pb.Timings(**record.get("timings", {})),
@@ -128,28 +132,42 @@ class JobManager:
         identity_message.CopyFrom(request)
         identity_message.ClearField("request_id")
         digest = hashlib.sha256(identity_message.SerializeToString(deterministic=True)).hexdigest()
-        if previous := self.request_ids.get(request.request_id):
+        return self._admit(request.request_id, digest, lambda: decode(request, self.assets))
+
+    def submit_simulation(self, request_id, simulation, decode_simulation):
+        digest = hashlib.sha256(b"isaacsim_rpc.v1\0" + simulation.SerializeToString(deterministic=True)).hexdigest()
+        return self._admit(request_id, digest, decode_simulation, unified=True)
+
+    def _admit(self, request_id, digest, decode_task, *, unified=False):
+        if not self.accepting:
+            raise ServiceError(grpc.StatusCode.UNAVAILABLE, "Gateway is stopping")
+        if not request_id.strip() or len(request_id) > 128:
+            raise ValueError("request_id must contain 1-128 characters")
+        if previous := self.request_ids.get(request_id):
             record = self.records[previous]
             if record["digest"] != digest:
                 raise ServiceError(grpc.StatusCode.ALREADY_EXISTS, "request_id was already used for a different task")
             return self.encode(record)
-        task = decode(request, self.assets)
+        task = decode_task()
+        if unified and shutil.disk_usage(self.settings.state_root).free < self.settings.min_free_bytes:
+            raise ServiceError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Insufficient space in the artifact store")
         if self.queue.full():
             raise ServiceError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Gateway queue is full; no task was accepted")
         self._prune()
         identity = uuid.uuid4().hex
         record = {
             "job_id": identity,
-            "request_id": request.request_id,
+            "request_id": request_id,
             "digest": digest,
             "operation": task.operation,
             "state": "QUEUED",
             "revision": 1,
             "created_at_unix": time.time(),
+            "unified": unified,
         }
         self._persist(record)
         self.records[identity] = record
-        self.request_ids[request.request_id] = identity
+        self.request_ids[request_id] = identity
         self.tasks[identity] = task
         self.queue.put_nowait(identity)
         return self.encode(record)
@@ -188,12 +206,16 @@ class JobManager:
         if len(self.records) < self.settings.retained_jobs:
             return
         completed = sorted(
-            (item for item in self.records.values() if item["state"] in TERMINAL),
+            (item for item in self.records.values() if item["state"] in TERMINAL
+             and (not item.get("unified") or item.get("released") or item["state"] != "SUCCEEDED")
+             and not self.downloads.get(item["job_id"])),
             key=lambda item: item["created_at_unix"],
         )
         if not completed:
-            raise ServiceError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Retained job capacity is occupied by active work")
+            raise ServiceError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Retained job capacity is occupied")
         for record in completed[: max(1, len(completed) // 4)]:
+            if record.get("unified"):
+                self.release_artifacts(record)
             self.records.pop(record["job_id"])
             self.request_ids.pop(record["request_id"])
             with self.database:
@@ -212,16 +234,47 @@ class JobManager:
                 started = time.perf_counter()
                 timings = {"gateway_queue_seconds": time.time() - record["created_at_unix"]}
                 async with self.changed:
-                    self._update(record, state="RUNNING", timings=timings)
+                    self._update(record, state="RUNNING", phase="simulating", started_at=time.time(), timings=timings)
                     self.changed.notify_all()
-                result, backend_timings = await self.backend.execute(
-                    self.tasks[identity], self.settings.state_root / "workflows" / identity
-                )
-                cleaned, artifacts = await asyncio.to_thread(self.artifacts.collect, result)
+                async def progress(value):
+                    fields = {key: value[key] for key in ("phase", "frames_done", "frames_total")
+                              if key in value and record.get(key) != value[key]}
+                    if fields:
+                        async with self.changed:
+                            self._update(record, **fields)
+                            self.changed.notify_all()
+
+                token = simulation_progress.set(progress if record.get("unified") else None)
+                try:
+                    result, backend_timings = await self.backend.execute(
+                        self.tasks[identity], self.settings.state_root / "workflows" / identity
+                    )
+                finally:
+                    simulation_progress.reset(token)
+                async with self.changed:
+                    if record.get("cancel_requested"):
+                        self._update(record, state="INTERRUPTED", finished_at=time.time(),
+                                     failure={"code": "CANCELLED", "message": "Cancelled by client"})
+                        self.changed.notify_all()
+                        continue
+                    self._update(record, phase="writing_artifacts")
+                    self.changed.notify_all()
+                if record.get("unified"):
+                    cleaned, artifacts = await asyncio.to_thread(
+                        self.artifacts.snapshot, result, self.settings.state_root / "downloads" / identity
+                    )
+                else:
+                    cleaned, artifacts = await asyncio.to_thread(self.artifacts.collect, result)
                 timings.update(backend_timings)
                 timings["total_seconds"] = timings["gateway_queue_seconds"] + time.perf_counter() - started
                 async with self.changed:
-                    self._update(record, state="SUCCEEDED", result=cleaned, artifacts=artifacts, timings=timings)
+                    if record.get("cancel_requested"):
+                        self.release_artifacts(record)
+                        self._update(record, state="INTERRUPTED", finished_at=time.time(),
+                                     failure={"code": "CANCELLED", "message": "Cancelled by client"})
+                    else:
+                        self._update(record, state="SUCCEEDED", result=cleaned, artifacts=artifacts, timings=timings,
+                                     finished_at=time.time())
                     self.changed.notify_all()
             except asyncio.CancelledError:
                 raise
@@ -242,8 +295,35 @@ class JobManager:
                 )
                 LOGGER.exception("Simulator task %s failed", identity)
                 async with self.changed:
-                    self._update(record, state="FAILED", failure={"code": code.name, "message": message})
+                    self._update(record, state="FAILED", failure={"code": code.name, "message": message},
+                                 finished_at=time.time())
                     self.changed.notify_all()
             finally:
                 self.tasks.pop(identity, None)
                 self.queue.task_done()
+
+    def release_artifacts(self, record):
+        """Release only this gateway job's private download directory."""
+        if record.get("released"):
+            return True, 0
+        identity = record["job_id"]
+        if self.downloads.get(identity):
+            return False, 0
+        directory = self.settings.state_root / "downloads" / identity
+        if directory.exists():
+            shutil.rmtree(directory)
+        size = sum(item["size_bytes"] for item in record.get("artifacts", []))
+        self._update(record, released=True)
+        return True, size
+
+    async def _expire_artifacts(self):
+        while True:
+            cutoff = time.time() - self.settings.retention_seconds
+            for record in list(self.records.values()):
+                if (record.get("unified") and not record.get("released") and record["state"] in TERMINAL
+                        and record.get("finished_at", record["created_at_unix"]) <= cutoff):
+                    try:
+                        self.release_artifacts(record)
+                    except OSError:
+                        LOGGER.exception("Could not expire artifacts for job %s", record["job_id"])
+            await asyncio.sleep(min(self.settings.retention_seconds, 60))

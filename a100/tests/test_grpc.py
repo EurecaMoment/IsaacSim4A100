@@ -80,6 +80,7 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
             Path(__file__).resolve().parents[1],
             capacity=2,
             workers=1,
+            min_free_bytes=0,
         )
         self.backend = ControlledBackend()
         self.manager = JobManager(self.settings, self.backend)
@@ -108,6 +109,44 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         async for job in self.client.WatchJob(pb.WatchJobRequest(job_id=job.job_id), metadata=self.metadata, timeout=3):
             pass
         return job
+
+    async def test_unified_submission_manifest_resume_and_release(self) -> None:
+        from rtx4090_grpc.server.rpc import simulation_pb2 as shared, simulation_pb2_grpc
+
+        client = simulation_pb2_grpc.SimulationServiceStub(self.channel)
+        results = self.root / "results"
+        results.mkdir()
+        self.backend.artifact = results / "state.npz"
+        self.backend.artifact.write_bytes(b"example artifact")
+        args = {"metadata": self.metadata, "timeout": 3}
+        request = shared.SubmitJobRequest(request_id="shared", simulation=shared.SimulateRequest(steps=2))
+        handle = await client.SubmitJob(request, **args)
+        self.assertEqual((await client.SubmitJob(request, **args)).id, handle.id)
+        request.simulation.steps = 3
+        with self.assertRaises(grpc.aio.AioRpcError) as conflict:
+            await client.SubmitJob(request, **args)
+        self.assertEqual(conflict.exception.code(), grpc.StatusCode.ALREADY_EXISTS)
+        query = shared.GetJobRequest(job_id=handle.id)
+        updates = [job async for job in client.WatchJob(query, **args)]
+        job = updates[-1]
+        self.assertEqual((job.state, job.phase), ("succeeded", "succeeded"))
+        artifact, = job.artifacts
+        self.assertEqual(artifact.relative_path, handle.id + "/state.npz")
+        self.assertEqual(artifact.sha256, hashlib.sha256(b"example artifact").hexdigest())
+        download = shared.DownloadArtifactRequest(job_id=handle.id, artifact_id=artifact.artifact_id,
+                                                  offset=8, chunk_bytes=3)
+        chunks = [part async for part in client.DownloadArtifact(download, **args)]
+        self.assertEqual(chunks[0].offset, 8)
+        self.assertEqual(b"".join(part.data for part in chunks), b"artifact")
+        ack = shared.AckJobRequest(job_id=handle.id)
+        released = await client.AckJob(ack, **args)
+        self.assertTrue(released.released)
+        self.assertEqual(released.freed_bytes, artifact.size_bytes)
+        self.assertEqual((await client.AckJob(ack, **args)).freed_bytes, 0)
+        self.assertEqual(self.backend.artifact.read_bytes(), b"example artifact")
+        with self.assertRaises(grpc.aio.AioRpcError) as gone:
+            await client.DownloadArtifact(download, **args).read()
+        self.assertEqual(gone.exception.code(), grpc.StatusCode.NOT_FOUND)
 
     async def test_authentication_covers_unary_and_streaming_methods(self) -> None:
         with self.assertRaises(grpc.aio.AioRpcError) as failure:

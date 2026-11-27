@@ -10,6 +10,6 @@ if [[ "${1:-}" = install ]]; then
     exit 0
 fi
 [[ -x "$gateway_env/bin/python" ]] || { echo "Run bash serve-grpc.sh install first" >&2; exit 2; }
-export PYTHONPATH="$A100SIM_CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$A100SIM_CODE_ROOT:$(dirname -- "$A100SIM_CODE_ROOT")${PYTHONPATH:+:$PYTHONPATH}"
 umask 077
 exec "$gateway_env/bin/python" -m a100sim.rpc.server "$@"

@@ -193,12 +193,16 @@ def build_server(
             ("grpc.max_send_message_length", 4 * 1024 * 1024),
         ],
     )
+    from a100sim.rpc.unified import SERVICE, UnifiedService, rpc as shared_rpc
+
     rpc.add_SimulatorServicer_to_server(SimulatorService(manager), server)
+    shared_rpc.simulation_pb2_grpc.add_SimulationServiceServicer_to_server(UnifiedService(manager, handle_errors), server)
     checker = health.HealthServicer()
     checker.set("", health_pb2.HealthCheckResponse.SERVING)
     checker.set(SERVICE_NAME, health_pb2.HealthCheckResponse.SERVING)
+    checker.set(SERVICE, health_pb2.HealthCheckResponse.SERVING)
     health_pb2_grpc.add_HealthServicer_to_server(checker, server)
-    reflection.enable_server_reflection((SERVICE_NAME, health.SERVICE_NAME, reflection.SERVICE_NAME), server)
+    reflection.enable_server_reflection((SERVICE_NAME, SERVICE, health.SERVICE_NAME, reflection.SERVICE_NAME), server)
     port = (
         server.add_secure_port(listen, grpc.ssl_server_credentials(((private_key, certificate),)))
         if certificate

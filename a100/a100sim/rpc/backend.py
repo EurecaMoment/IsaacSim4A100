@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,6 +19,10 @@ from a100sim.rpc.config import Settings
 from a100sim.rpc.errors import ServiceError
 from a100sim.rpc.v1 import simulator_pb2 as pb
 from a100sim.rpc.workflows import Workflows
+
+simulation_progress: ContextVar[Callable[[dict], Awaitable[None]] | None] = ContextVar(
+    "simulation_progress", default=None
+)
 
 FEATURE_ACTIONS = {
     "snapshot": "snapshot",
@@ -308,6 +313,9 @@ class SimulatorBackend:
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
             value = await self._request(backend, status_route)
+            report = simulation_progress.get()
+            if report is not None:
+                await report(value)
             state = value.get("state")
             if state == "succeeded":
                 if randomization is not None:
