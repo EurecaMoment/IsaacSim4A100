@@ -1,7 +1,7 @@
 # Retained scene capture on A100
 
 This worker implements the registered scene operations used by BenchForge. The
-existing `a100sim.v1.Simulator` gateway remains the only public interface. Kit,
+public gateway exposes `isaacsim_rpc.v1.SimulationService`. Kit,
 CUDA PhysX and rendering run in the simulator worker, outside DSH and outside the
 gateway Python environment.
 
@@ -25,9 +25,22 @@ slots and 8 threads per slot, the budget is 128 and the late-arrival minimum is 
 
 The scene worker needs the same asset root and result directories as the gateway.
 
-Operations are discovered through `GetCapabilities` and submitted with
-`SubmitTask.extension`: `asset.import`, `scene.edit`, `physics.step`,
-`world.observe`, `scene.inspect`, `scene.capture`, `scene.export`, `scene.close`.
+Discover operations with `GetCapabilities`. Call `SubmitJob` with a stable
+`request_id` and place the operation in `native_task.extension`. The scene worker
+provides `asset.import`, `scene.edit`, `physics.step`, `world.observe`,
+`scene.inspect`, `scene.preview`, `scene.capture`, `scene.export` and `scene.close`.
+Use the returned job ID with `WatchJob` or `GetJob`. The `native_job` field holds
+the typed operation result. Download files with `DownloadArtifact` using the same
+job ID and the artifact ID from its manifest.
+
+From the repository root, the portable CLI can query the same endpoint and
+invoke a catalog feature with its JSON arguments:
+
+```bash
+python a100/examples/grpc_client.py --target 127.0.0.1:50051 catalog
+python a100/examples/grpc_client.py --target 127.0.0.1:50051 invoke joints.state --output ./observations
+```
+
 Use asset IDs and relative file names from `UploadAsset` for `asset.import.source`.
 Subsequent operations take the returned `session_id`. Scene edits precede settling;
 capture accepts up to 32 authored camera paths, 64–2048 square pixels, 1–1024 samples

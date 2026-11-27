@@ -32,8 +32,13 @@ from a100sim.rpc.jobs import JobManager
 from a100sim.rpc.server import build_server
 from a100sim.rpc.storage import ArtifactStore, AssetStore
 from a100sim.rpc.v1 import simulator_pb2 as pb
-from a100sim.rpc.v1 import simulator_pb2_grpc as rpc
 from a100sim.service_queue import JobQueue, start_http
+
+from rtx4090_grpc.server.rpc import native_pb2 as native
+from rtx4090_grpc.server.rpc import simulation_pb2 as shared
+from rtx4090_grpc.server.rpc import simulation_pb2_grpc
+
+SERVICE = "isaacsim_rpc.v1.SimulationService"
 
 
 class ControlledBackend:
@@ -85,12 +90,23 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         self.backend = ControlledBackend()
         self.manager = JobManager(self.settings, self.backend)
         await self.manager.start()
+        self.metadata = (("authorization", "Bearer test-token"),)
+        await self.connect_gateway()
+
+    async def connect_gateway(self) -> None:
         self.server, port = build_server(self.manager, "127.0.0.1:0", token="test-token")
         await self.server.start()
         self.target = f"127.0.0.1:{port}"
         self.channel = grpc.aio.insecure_channel(self.target)
-        self.client = rpc.SimulatorStub(self.channel)
-        self.metadata = (("authorization", "Bearer test-token"),)
+        self.client = simulation_pb2_grpc.SimulationServiceStub(self.channel)
+
+    async def restart_gateway(self) -> None:
+        await self.channel.close()
+        await self.server.stop(0)
+        await self.manager.close()
+        self.manager = JobManager(self.settings, self.backend)
+        await self.manager.start()
+        await self.connect_gateway()
 
     async def asyncTearDown(self) -> None:
         await self.channel.close()
@@ -98,54 +114,55 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.close()
         self.temporary.cleanup()
 
-    async def submit(self, request_id: str, **task: Any) -> pb.Job:
-        """Submit using the same public metadata as an authenticated remote caller."""
-        return await self.client.SubmitTask(
-            pb.SubmitTaskRequest(request_id=request_id, **task), metadata=self.metadata, timeout=2
+    async def submit(self, request_id: str, **task: Any) -> shared.JobHandle:
+        return await self.client.SubmitJob(
+            shared.SubmitJobRequest(request_id=request_id, native_task=native.SubmitTaskRequest(**task)),
+            metadata=self.metadata,
+            timeout=2,
         )
 
-    async def finish(self, job: pb.Job) -> pb.Job:
-        """Read the task's terminal revision without client-side polling."""
-        async for job in self.client.WatchJob(pb.WatchJobRequest(job_id=job.job_id), metadata=self.metadata, timeout=3):
-            pass
+    async def finish(self, handle: shared.JobHandle) -> shared.Job:
+        query = shared.GetJobRequest(job_id=handle.id)
+        updates = [job async for job in self.client.WatchJob(query, metadata=self.metadata, timeout=3)]
+        job = updates[-1]
+        self.assertEqual((job.id, job.native_job.job_id), (handle.id, handle.id))
+        self.assertEqual(job, await self.client.GetJob(query, metadata=self.metadata, timeout=2))
         return job
 
     async def test_unified_submission_manifest_resume_and_release(self) -> None:
-        from rtx4090_grpc.server.rpc import simulation_pb2 as shared, simulation_pb2_grpc
-
-        client = simulation_pb2_grpc.SimulationServiceStub(self.channel)
         results = self.root / "results"
         results.mkdir()
         self.backend.artifact = results / "state.npz"
         self.backend.artifact.write_bytes(b"example artifact")
         args = {"metadata": self.metadata, "timeout": 3}
         request = shared.SubmitJobRequest(request_id="shared", simulation=shared.SimulateRequest(steps=2))
-        handle = await client.SubmitJob(request, **args)
-        self.assertEqual((await client.SubmitJob(request, **args)).id, handle.id)
+        handle = await self.client.SubmitJob(request, **args)
+        self.assertEqual((await self.client.SubmitJob(request, **args)).id, handle.id)
         request.simulation.steps = 3
         with self.assertRaises(grpc.aio.AioRpcError) as conflict:
-            await client.SubmitJob(request, **args)
+            await self.client.SubmitJob(request, **args)
         self.assertEqual(conflict.exception.code(), grpc.StatusCode.ALREADY_EXISTS)
         query = shared.GetJobRequest(job_id=handle.id)
-        updates = [job async for job in client.WatchJob(query, **args)]
+        updates = [job async for job in self.client.WatchJob(query, **args)]
         job = updates[-1]
         self.assertEqual((job.state, job.phase), ("succeeded", "succeeded"))
-        artifact, = job.artifacts
+        (artifact,) = job.artifacts
         self.assertEqual(artifact.relative_path, handle.id + "/state.npz")
         self.assertEqual(artifact.sha256, hashlib.sha256(b"example artifact").hexdigest())
-        download = shared.DownloadArtifactRequest(job_id=handle.id, artifact_id=artifact.artifact_id,
-                                                  offset=8, chunk_bytes=3)
-        chunks = [part async for part in client.DownloadArtifact(download, **args)]
+        download = shared.DownloadArtifactRequest(
+            job_id=handle.id, artifact_id=artifact.artifact_id, offset=8, chunk_bytes=3
+        )
+        chunks = [part async for part in self.client.DownloadArtifact(download, **args)]
         self.assertEqual(chunks[0].offset, 8)
         self.assertEqual(b"".join(part.data for part in chunks), b"artifact")
         ack = shared.AckJobRequest(job_id=handle.id)
-        released = await client.AckJob(ack, **args)
+        released = await self.client.AckJob(ack, **args)
         self.assertTrue(released.released)
         self.assertEqual(released.freed_bytes, artifact.size_bytes)
-        self.assertEqual((await client.AckJob(ack, **args)).freed_bytes, 0)
+        self.assertEqual((await self.client.AckJob(ack, **args)).freed_bytes, 0)
         self.assertEqual(self.backend.artifact.read_bytes(), b"example artifact")
         with self.assertRaises(grpc.aio.AioRpcError) as gone:
-            await client.DownloadArtifact(download, **args).read()
+            await self.client.DownloadArtifact(download, **args).read()
         self.assertEqual(gone.exception.code(), grpc.StatusCode.NOT_FOUND)
 
     async def test_authentication_covers_unary_and_streaming_methods(self) -> None:
@@ -153,7 +170,7 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
             await self.client.GetCapabilities(Empty(), timeout=1)
         self.assertEqual(failure.exception.code(), grpc.StatusCode.UNAUTHENTICATED)
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
-            async for _ in self.client.WatchJob(pb.WatchJobRequest(job_id="x"), timeout=1):
+            async for _ in self.client.WatchJob(shared.GetJobRequest(job_id="x"), timeout=1):
                 pass
         self.assertEqual(failure.exception.code(), grpc.StatusCode.UNAUTHENTICATED)
         info = await self.client.GetCapabilities(Empty(), metadata=self.metadata, timeout=1)
@@ -161,9 +178,7 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_standard_health_and_reflection_share_the_rpc_authentication(self) -> None:
         health = health_pb2_grpc.HealthStub(self.channel)
-        status = await health.Check(
-            health_pb2.HealthCheckRequest(service="a100sim.v1.Simulator"), metadata=self.metadata, timeout=2
-        )
+        status = await health.Check(health_pb2.HealthCheckRequest(service=SERVICE), metadata=self.metadata, timeout=2)
         self.assertEqual(status.status, health_pb2.HealthCheckResponse.SERVING)
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
             await health.Check(health_pb2.HealthCheckRequest(), timeout=1)
@@ -176,7 +191,13 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         replies = [
             reply async for reply in inspector.ServerReflectionInfo(list_services(), metadata=self.metadata, timeout=2)
         ]
-        self.assertIn("a100sim.v1.Simulator", [item.name for item in replies[0].list_services_response.service])
+        services = {item.name for item in replies[0].list_services_response.service}
+        self.assertIn(SERVICE, services)
+        self.assertNotIn("a100sim.v1.Simulator", services)
+        retired = self.channel.unary_unary("/a100sim.v1.Simulator/GetCapabilities")
+        with self.assertRaises(grpc.aio.AioRpcError) as failure:
+            await retired(b"", metadata=self.metadata, timeout=2)
+        self.assertEqual(failure.exception.code(), grpc.StatusCode.UNIMPLEMENTED)
 
     async def test_portable_cli_uploads_invokes_downloads_and_probes_health(self) -> None:
         adapter = Path(__file__).resolve().parents[1]
@@ -228,7 +249,7 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         catalog = await self.client.GetApiCatalog(Empty(), metadata=self.metadata, timeout=3)
         self.assertEqual(catalog.simulator_version, "6.2.0.0")
         self.assertEqual([domain.number for domain in catalog.domains], list(range(1, 31)))
-        self.assertEqual(sum(len(domain.features) for domain in catalog.domains), 138)
+        self.assertEqual(sum(len(domain.features) for domain in catalog.domains), 139)
         before = len(self.manager.records)
         for feature_id, code in [
             ("range_sensors.rtx_lidar", grpc.StatusCode.UNIMPLEMENTED),
@@ -236,51 +257,67 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
             ("does.not.exist", grpc.StatusCode.NOT_FOUND),
         ]:
             with self.subTest(feature_id=feature_id), self.assertRaises(grpc.aio.AioRpcError) as failure:
-                await self.client.InvokeFeature(
-                    pb.FeatureRequest(request_id="gap", feature_id=feature_id), metadata=self.metadata, timeout=2
+                await self.client.SubmitJob(
+                    shared.SubmitJobRequest(
+                        request_id="gap", native_feature=native.FeatureRequest(feature_id=feature_id)
+                    ),
+                    metadata=self.metadata,
+                    timeout=2,
                 )
             self.assertEqual(failure.exception.code(), code)
         self.assertEqual(len(self.manager.records), before)
 
     async def test_feature_invocation_preserves_typed_validation_and_idempotency(self) -> None:
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
-            await self.client.InvokeFeature(pb.FeatureRequest(feature_id="joints.state"), timeout=2)
+            await self.client.SubmitJob(
+                shared.SubmitJobRequest(native_feature=native.FeatureRequest(feature_id="joints.state")), timeout=2
+            )
         self.assertEqual(failure.exception.code(), grpc.StatusCode.UNAUTHENTICATED)
-        feature = pb.FeatureRequest(
+        feature = shared.SubmitJobRequest(
             request_id="same-operation",
-            feature_id="joints.velocity",
-            arguments={"targets": [{"values": [0.2, -0.1]}], "steps": 2},
+            native_feature=native.FeatureRequest(
+                feature_id="joints.velocity", arguments={"targets": [{"values": [0.2, -0.1]}], "steps": 2}
+            ),
         )
-        invoked = await self.client.InvokeFeature(feature, metadata=self.metadata, timeout=2)
+        invoked = await self.client.SubmitJob(feature, metadata=self.metadata, timeout=2)
         direct = await self.submit(
             "same-operation",
-            control=pb.ControlRequest(mode=pb.VELOCITY, targets=[pb.JointTargets(values=[0.2, -0.1])], steps=2),
+            control=native.ControlRequest(
+                mode=native.VELOCITY, targets=[native.JointTargets(values=[0.2, -0.1])], steps=2
+            ),
         )
-        self.assertEqual(invoked.job_id, direct.job_id)
-        self.assertEqual((await self.finish(invoked)).state, pb.SUCCEEDED)
+        self.assertEqual(invoked.id, direct.id)
+        self.assertEqual((await self.finish(invoked)).native_job.state, native.SUCCEEDED)
         self.assertEqual(self.backend.executions, 1)
         for arguments in ({"unknown": True}, {"mode": "EFFORT"}, {"steps": -1}, {"steps": "not-an-integer"}):
             with self.subTest(arguments=arguments), self.assertRaises(grpc.aio.AioRpcError) as failure:
-                await self.client.InvokeFeature(
-                    pb.FeatureRequest(request_id="invalid", feature_id="joints.velocity", arguments=arguments),
+                await self.client.SubmitJob(
+                    shared.SubmitJobRequest(
+                        request_id="invalid",
+                        native_feature=native.FeatureRequest(feature_id="joints.velocity", arguments=arguments),
+                    ),
                     metadata=self.metadata,
                     timeout=2,
                 )
             self.assertEqual(failure.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
-        snapshot = await self.client.InvokeFeature(
-            pb.FeatureRequest(request_id="empty-message", feature_id="joints.state"), metadata=self.metadata, timeout=2
+        snapshot = await self.client.SubmitJob(
+            shared.SubmitJobRequest(
+                request_id="empty-message", native_feature=native.FeatureRequest(feature_id="joints.state")
+            ),
+            metadata=self.metadata,
+            timeout=2,
         )
-        self.assertEqual((await self.finish(snapshot)).operation, "snapshot")
+        self.assertEqual((await self.finish(snapshot)).native_job.operation, "snapshot")
 
     async def test_idempotency_executes_once_and_rejects_changed_payload(self) -> None:
-        requests = [self.submit("same-id", step=pb.StepRequest(steps=3)) for _ in range(12)]
+        requests = [self.submit("same-id", step=native.StepRequest(steps=3)) for _ in range(12)]
         jobs = await asyncio.gather(*requests)
-        self.assertEqual(len({job.job_id for job in jobs}), 1)
+        self.assertEqual(len({job.id for job in jobs}), 1)
         job = await self.finish(jobs[0])
-        self.assertEqual(job.state, pb.SUCCEEDED)
+        self.assertEqual((job.state, job.native_job.state), ("succeeded", native.SUCCEEDED))
         self.assertEqual(self.backend.executions, 1)
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
-            await self.submit("same-id", step=pb.StepRequest(steps=4))
+            await self.submit("same-id", step=native.StepRequest(steps=4))
         self.assertEqual(failure.exception.code(), grpc.StatusCode.ALREADY_EXISTS)
 
     async def test_queue_backpressure_and_queued_only_cancellation(self) -> None:
@@ -295,10 +332,10 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
             await self.submit("overflow", snapshot=Empty())
         self.assertEqual(failure.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
-        cancelled = await self.client.CancelJob(pb.JobRequest(job_id=queued.job_id), metadata=self.metadata)
-        self.assertEqual(cancelled.state, pb.CANCELLED)
+        cancelled = await self.client.CancelJob(shared.GetJobRequest(job_id=queued.id), metadata=self.metadata)
+        self.assertEqual((cancelled.state, cancelled.native_job.state), ("interrupted", native.CANCELLED))
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
-            await self.client.CancelJob(pb.JobRequest(job_id=active.job_id), metadata=self.metadata)
+            await self.client.CancelJob(shared.GetJobRequest(job_id=active.id), metadata=self.metadata)
         self.assertEqual(failure.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
         self.backend.release.set()
         await self.finish(active)
@@ -307,30 +344,32 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_deadline_does_not_cancel_or_duplicate_mutation(self) -> None:
         self.backend.release.clear()
-        job = await self.submit("deadline", step=pb.StepRequest(steps=5))
+        job = await self.submit("deadline", step=native.StepRequest(steps=5))
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
             async for _ in self.client.WatchJob(
-                pb.WatchJobRequest(job_id=job.job_id), timeout=0.03, metadata=self.metadata
+                shared.GetJobRequest(job_id=job.id), timeout=0.03, metadata=self.metadata
             ):
                 pass
         self.assertEqual(failure.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
-        retry = await self.submit("deadline", step=pb.StepRequest(steps=5))
-        self.assertEqual(retry.job_id, job.job_id)
+        retry = await self.submit("deadline", step=native.StepRequest(steps=5))
+        self.assertEqual(retry.id, job.id)
         self.backend.release.set()
-        self.assertEqual((await self.finish(retry)).state, pb.SUCCEEDED)
+        self.assertEqual((await self.finish(retry)).state, "succeeded")
         self.assertEqual(self.backend.executions, 1)
 
     async def test_asset_upload_download_resume_and_job_ownership(self) -> None:
         contents = b"uploaded robot description"
 
         async def upload(path: str = "robot.urdf", digest: str = "") -> Any:
-            yield pb.UploadChunk(asset_id="robot", relative_path=path, data=contents[:7], sha256=digest)
-            yield pb.UploadChunk(data=contents[7:])
+            yield native.UploadChunk(asset_id="robot", relative_path=path, data=contents[:7], sha256=digest)
+            yield native.UploadChunk(data=contents[7:])
 
         uploaded = await self.client.UploadAsset(
             upload(digest=hashlib.sha256(contents).hexdigest()), metadata=self.metadata
         )
         self.assertEqual(uploaded.size_bytes, len(contents))
+        listed = await self.client.ListAssets(Empty(), metadata=self.metadata)
+        self.assertEqual([(a.asset_id, list(a.files)) for a in listed.assets], [("robot", ["robot.urdf"])])
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
             await self.client.UploadAsset(upload(), metadata=self.metadata)
         self.assertEqual(failure.exception.code(), grpc.StatusCode.ALREADY_EXISTS)
@@ -346,12 +385,12 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         self.backend.artifact = result
         job = await self.finish(await self.submit("artifact", snapshot=Empty()))
         self.assertEqual(len(job.artifacts), 1)
-        self.assertTrue(MessageToDict(job.result)["file"].startswith("artifact://"))
+        self.assertTrue(MessageToDict(job.native_job.result)["file"].startswith("artifact://"))
         blocks = [
             chunk.data
             async for chunk in self.client.DownloadArtifact(
-                pb.DownloadRequest(
-                    job_id=job.job_id, artifact_id=job.artifacts[0].artifact_id, offset=7, chunk_bytes=4
+                shared.DownloadArtifactRequest(
+                    job_id=job.id, artifact_id=job.artifacts[0].artifact_id, offset=7, chunk_bytes=4
                 ),
                 metadata=self.metadata,
             )
@@ -361,48 +400,81 @@ class GrpcContractTests(unittest.IsolatedAsyncioTestCase):
         another = await self.finish(await self.submit("other", snapshot=Empty()))
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
             async for _ in self.client.DownloadArtifact(
-                pb.DownloadRequest(job_id=another.job_id, artifact_id=job.artifacts[0].artifact_id),
+                shared.DownloadArtifactRequest(job_id=another.id, artifact_id=job.artifacts[0].artifact_id),
                 metadata=self.metadata,
             ):
                 pass
         self.assertEqual(failure.exception.code(), grpc.StatusCode.NOT_FOUND)
+        ack = await self.client.AckJob(shared.AckJobRequest(job_id=job.id), metadata=self.metadata)
+        self.assertTrue(ack.released)
+        self.assertEqual(ack.freed_bytes, len(contents))
+        self.assertEqual(result.read_bytes(), contents)
 
-    async def test_ordered_duplex_stream_and_unknown_jobs(self) -> None:
-        async def tasks() -> Any:
-            for i in range(4):
-                yield pb.SubmitTaskRequest(request_id=f"ordered-{i}", step=pb.StepRequest(steps=i + 1))
-
-        jobs = [job async for job in self.client.RunTasks(tasks(), metadata=self.metadata, timeout=3)]
-        self.assertEqual([job.request_id for job in jobs], [f"ordered-{i}" for i in range(4)])
-        self.assertTrue(all(job.state == pb.SUCCEEDED for job in jobs))
+    async def test_ordered_native_submissions_and_unknown_jobs(self) -> None:
+        jobs = [
+            await self.finish(await self.submit(f"ordered-{i}", step=native.StepRequest(steps=i + 1))) for i in range(4)
+        ]
+        self.assertEqual([job.native_job.request_id for job in jobs], [f"ordered-{i}" for i in range(4)])
+        self.assertTrue(all(job.state == "succeeded" for job in jobs))
+        self.assertEqual(self.backend.executions, len(jobs))
         with self.assertRaises(grpc.aio.AioRpcError) as failure:
-            await self.client.GetJob(pb.JobRequest(job_id="missing"), metadata=self.metadata)
+            await self.client.GetJob(shared.GetJobRequest(job_id="0" * 32), metadata=self.metadata)
         self.assertEqual(failure.exception.code(), grpc.StatusCode.NOT_FOUND)
 
     async def test_restart_preserves_deduplication_and_does_not_replay(self) -> None:
         self.backend.release.clear()
         job = await self.submit("restart", snapshot=Empty())
-        await self.server.stop(0)
-        await self.manager.close()
-        self.manager = JobManager(self.settings, self.backend)
-        await self.manager.start()
-        recovered = await self.manager.submit(pb.SubmitTaskRequest(request_id="restart", snapshot=Empty()))
-        self.assertEqual(recovered.job_id, job.job_id)
-        self.assertEqual(recovered.state, pb.INTERRUPTED)
+        await self.restart_gateway()
+        recovered = await self.submit("restart", snapshot=Empty())
+        self.assertEqual(recovered.id, job.id)
+        saved = await self.finish(recovered)
+        self.assertEqual((saved.state, saved.native_job.state), ("interrupted", native.INTERRUPTED))
         self.assertTrue(self.manager.queue.empty())
+
+    async def test_historical_native_artifacts_are_readable_under_the_original_job_id(self) -> None:
+        source = self.root / "results" / "legacy.txt"
+        source.parent.mkdir()
+        source.write_bytes(b"historical artifact")
+        self.backend.artifact = source
+        # Seed a historical native job using the unchanged internal record format.
+        original = await self.manager.submit(pb.SubmitTaskRequest(request_id="historical", snapshot=Empty()))
+        await asyncio.wait_for(self.manager.queue.join(), timeout=2)
+        record = self.manager.get_record(original.job_id)
+        record.pop("snapshot_artifacts")
+        record.pop("unified")
+        self.manager._persist(record)
+        await self.restart_gateway()
+        recovered = await self.submit("historical", snapshot=Empty())
+        self.assertEqual(recovered.id, original.job_id)
+        job = await self.finish(recovered)
+        self.assertEqual((job.state, job.native_job.state), ("succeeded", native.SUCCEEDED))
+        (artifact,) = job.artifacts
+        self.assertEqual(artifact.artifact_id, job.native_job.artifacts[0].artifact_id)
+        download = shared.DownloadArtifactRequest(job_id=job.id, artifact_id=artifact.artifact_id)
+        stream = self.client.DownloadArtifact(download, metadata=self.metadata)
+        contents = b"".join([part.data async for part in stream])
+        self.assertEqual(contents, source.read_bytes())
+        with self.assertRaises(grpc.aio.AioRpcError) as failure:
+            await self.client.AckJob(shared.AckJobRequest(job_id=job.id), metadata=self.metadata)
+        self.assertEqual(failure.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.assertEqual(source.read_bytes(), b"historical artifact")
+        self.assertEqual(self.backend.executions, 1)
 
     async def test_watch_delivers_terminal_revision_if_job_finishes_between_reads(self) -> None:
         self.backend.release.clear()
-        job = await self.manager.submit(pb.SubmitTaskRequest(request_id="watch-race", snapshot=Empty()))
-        updates = self.manager.observe(job.job_id)
-        first = await anext(updates)
-        self.assertIn(first.state, (pb.QUEUED, pb.RUNNING))
+        handle = await self.submit("watch-race", snapshot=Empty())
+        query = shared.GetJobRequest(job_id=handle.id)
+        updates = self.client.WatchJob(query, metadata=self.metadata, timeout=3)
+        first = await updates.read()
+        self.assertIn(first.native_job.state, (native.QUEUED, native.RUNNING))
         self.backend.release.set()
         await asyncio.wait_for(self.manager.queue.join(), timeout=2)
-        terminal = await anext(updates)
-        self.assertEqual(terminal.state, pb.SUCCEEDED)
-        self.assertGreater(terminal.revision, first.revision)
-        await updates.aclose()
+        query.after_revision = first.native_job.revision
+        resumed = [job async for job in self.client.WatchJob(query, metadata=self.metadata, timeout=2)]
+        self.assertEqual([job.state for job in resumed], ["succeeded"])
+        self.assertEqual(resumed[0].native_job.state, native.SUCCEEDED)
+        self.assertGreater(resumed[0].native_job.revision, first.native_job.revision)
+        updates.cancel()
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -536,7 +608,14 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_catalog_covers_protocol_operations_and_keeps_scope_separate_from_readiness(self) -> None:
         operations = set(SCOPES)
         mapped = {feature.task for domain in DOMAINS for feature in domain.features if feature.task}
-        self.assertEqual(operations, mapped)
+        self.assertEqual(operations | {"extension"}, mapped)
+        extensions = {
+            feature.fixed["operation"]
+            for domain in DOMAINS
+            for feature in domain.features
+            if feature.task == "extension"
+        }
+        self.assertEqual(extensions, {"scene.preview"})
         ready = [pb.Capability(name=name, availability=pb.AVAILABLE) for name in operations]
         for capabilities, expected in (([], pb.UNAVAILABLE), (ready, pb.PARTIAL)):
             catalog = build_catalog(capabilities)

@@ -12,14 +12,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
 from google.protobuf.json_format import MessageToDict
 
-from a100sim.rpc.v1 import simulator_pb2 as pb
-from a100sim.rpc.v1 import simulator_pb2_grpc as rpc
+from rtx4090_grpc.server.rpc import native_pb2, simulation_pb2, simulation_pb2_grpc
 
 
 async def run(arguments: argparse.Namespace) -> None:
@@ -32,7 +31,7 @@ async def run(arguments: argparse.Namespace) -> None:
         else grpc.aio.insecure_channel(arguments.target)
     )
     async with channel:
-        client = rpc.SimulatorStub(channel)
+        client = simulation_pb2_grpc.SimulationServiceStub(channel)
         if arguments.command in ("capabilities", "catalog", "assets"):
             method = {
                 "capabilities": client.GetCapabilities,
@@ -51,7 +50,7 @@ async def run(arguments: argparse.Namespace) -> None:
                     first = True
                     while True:
                         chunk = stream.read(1024 * 1024)
-                        yield pb.UploadChunk(
+                        yield native_pb2.UploadChunk(
                             asset_id=arguments.asset_id if first else "",
                             relative_path=(arguments.relative_path or arguments.file.name) if first else "",
                             sha256=digest.hexdigest() if first else "",
@@ -67,15 +66,22 @@ async def run(arguments: argparse.Namespace) -> None:
             # Print before admission so an ambiguous timeout can be retried with this exact ID.
             print(json.dumps({"request_id": request_id}), flush=True)
             payload = json.loads(arguments.arguments.read_text(encoding="utf-8")) if arguments.arguments else {}
-            value = await client.InvokeFeature(
-                pb.FeatureRequest(request_id=request_id, feature_id=arguments.feature, arguments=payload),
+            handle = await client.SubmitJob(
+                simulation_pb2.SubmitJobRequest(
+                    request_id=request_id,
+                    native_feature=native_pb2.FeatureRequest(feature_id=arguments.feature, arguments=payload),
+                ),
                 metadata=metadata,
                 timeout=10,
             )
-            job_id = value.job_id
-            async for snapshot in client.WatchJob(pb.WatchJobRequest(job_id=job_id), metadata=metadata, timeout=900):
-                value = snapshot
-            if value.state != pb.SUCCEEDED:
+            job_id = handle.id
+            query = simulation_pb2.GetJobRequest(job_id=job_id)
+            value = None
+            async for snapshot in client.WatchJob(query, metadata=metadata, timeout=900):
+                value = snapshot.native_job
+            if value is None:
+                raise RuntimeError(f"Job {job_id} watch ended without a receipt")
+            if value.state != native_pb2.SUCCEEDED:
                 raise RuntimeError(f"Job {job_id}: {value.failure.code}: {value.failure.message}")
             if arguments.output:
                 arguments.output.mkdir(parents=True, exist_ok=True)
@@ -86,7 +92,7 @@ async def run(arguments: argparse.Namespace) -> None:
                     count = 0
                     with destination.open("wb") as stream:
                         async for chunk in client.DownloadArtifact(
-                            pb.DownloadRequest(job_id=job_id, artifact_id=item.artifact_id),
+                            simulation_pb2.DownloadArtifactRequest(job_id=job_id, artifact_id=item.artifact_id),
                             metadata=metadata,
                             timeout=300,
                         ):
