@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ class RtxQueueWithFrameCapture(RtxQueue):
         return super().health() | {
             "max_views": MAX_VIEWS,
             "capabilities": ["multiview_final", "multiview_frames", "metric_depth",
-                             "semantic_masks", "visible_bboxes", "registered_mesh_npz"],
+                             "semantic_masks", "instance_masks", "visible_bboxes", "registered_mesh_npz"],
         }
 
     def _progress(self, **kw) -> None:
@@ -466,8 +467,9 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 item = {"product": product, "calibration": calibration, "annotators": {}}
                 ctx["products"].append(item)
                 for key, annotator_name in (("rgb", "rgb"), ("depth", "distance_to_image_plane"),
-                                            ("semantic", "semantic_segmentation")):
-                    params = {"init_params": {"colorize": False}} if key == "semantic" else {}
+                                            ("semantic", "semantic_segmentation"),
+                                            ("instance", "instance_id_segmentation")):
+                    params = {"init_params": {"colorize": False}} if key in ("semantic", "instance") else {}
                     annotator = rep.AnnotatorRegistry.get_annotator(annotator_name, **params)
                     annotator.attach([product])
                     item["annotators"][key] = annotator
@@ -511,10 +513,11 @@ class RtxQueueWithFrameCapture(RtxQueue):
         # All render products sample the same frozen USD poses in one orchestrator step.
         task = asyncio.ensure_future(rep.orchestrator.step_async(
             rt_subframes=ctx["rt_subframes"], delta_time=0.0, pause_timeline=True))
-        deadline = time.monotonic() + 120
+        timeout = float(os.environ.get("RTX4090_FRAME_TIMEOUT_SECONDS", "600"))
+        deadline = time.monotonic() + timeout
         while not task.done():
             self.app.update()
-            if time.monotonic() > deadline:
+            if not task.done() and time.monotonic() > deadline:
                 task.cancel()
                 raise TimeoutError(f"RTX frame {frame_idx} timed out")
         task.result()
@@ -541,6 +544,10 @@ class RtxQueueWithFrameCapture(RtxQueue):
         depth = np.asarray(annotators["depth"].get_data(), dtype=np.float32).squeeze()
         segmentation = annotators["semantic"].get_data()
         semantic = np.asarray(segmentation["data"], dtype=np.uint32).squeeze()
+        instance_output = annotators["instance"].get_data()
+        instance = np.asarray(instance_output["data"], dtype=np.uint32).squeeze()
+        if instance.shape != (size, size):
+            raise RuntimeError(f"Frame {frame_idx} instance shape {instance.shape} disagrees with RGB")
         if rgb.shape[:2] != (size, size) or depth.shape != (size, size) or semantic.shape != (size, size):
             raise RuntimeError(f"Frame {frame_idx} bad shapes: rgb={rgb.shape} depth={depth.shape} sem={semantic.shape}")
 
@@ -548,6 +555,8 @@ class RtxQueueWithFrameCapture(RtxQueue):
         Image.fromarray(rgb).save(image_path)
         np.save(frame_dir / "depth_m.npy", depth)
         np.save(frame_dir / "semantic_ids.npy", semantic)
+        np.save(frame_dir / "instance_ids.npy", instance)
+        persist(frame_dir / "instance_labels.json", instance_output.get("info", {}))
         persist(frame_dir / "semantic_labels.json", segmentation.get("info", {}))
         if view_id is not None:
             labels = segmentation.get("info", {}).get("idToLabels", {})
@@ -563,6 +572,8 @@ class RtxQueueWithFrameCapture(RtxQueue):
             "depth_m": str(frame_dir / "depth_m.npy"),
             "semantic_ids": str(frame_dir / "semantic_ids.npy"),
             "semantic_labels": str(frame_dir / "semantic_labels.json"),
+            "instance_ids": str(frame_dir / "instance_ids.npy"),
+            "instance_labels": str(frame_dir / "instance_labels.json"),
         }
 
     def _shutdown_frame_render(self, ctx: dict) -> None:
