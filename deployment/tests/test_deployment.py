@@ -12,10 +12,10 @@ from unittest.mock import patch
 from deployment.detect_gpu import classify_gpu, read_gpus, select_gpu
 
 
-def make_device(index: int, name: str, used: int = 0) -> dict:
+def make_device(index: int, name: str, used: int = 0, capability: str = "8.9") -> dict:
     """Create one inventory row for routing boundary cases."""
     return {"index": index, "uuid": f"GPU-example-{index}", "name": name, "driver": "550.54.15",
-            "memory_total_mib": 81920, "memory_used_mib": used}
+            "memory_total_mib": 81920, "memory_used_mib": used, "compute_capability": capability}
 
 
 class GpuSelectionTests(unittest.TestCase):
@@ -27,14 +27,18 @@ class GpuSelectionTests(unittest.TestCase):
                                ("NVIDIA A100-PCIE-40GB", "cuda"), ("NVIDIA A800-SXM4-80GB", "cuda"),
                                ("NVIDIA A800 80GB PCIe", "cuda"), ("NVIDIA L40S", "rtx")):
             with self.subTest(name=name):
-                self.assertEqual(classify_gpu(name), expected)
+                self.assertEqual(classify_gpu(name, "8.0" if expected == "cuda" else "8.9"), expected)
+        self.assertEqual(classify_gpu("unlisted SM80 accelerator", "8.0"), "cuda")
+        self.assertIsNone(classify_gpu("unknown", "9.0"))
 
     def test_auto_selects_recognized_gpu_with_least_used_memory(self) -> None:
         """Avoid busy GPUs and unknown devices; resolve explicit UUIDs exactly."""
         devices = [make_device(0, "unknown", 0), make_device(1, "NVIDIA RTX 4090", 3000),
-                   make_device(2, "NVIDIA A800-SXM4-80GB", 1)]
+                   make_device(2, "NVIDIA A800-SXM4-80GB", 1, "8.0")]
         self.assertEqual(select_gpu(devices, "auto")["index"], 2)
         self.assertEqual(select_gpu(devices, "auto", "rtx")["index"], 1)
+        devices[1]["memory_used_mib"] = 0
+        self.assertEqual(select_gpu(devices, "auto", "cuda")["index"], 2)
         self.assertEqual(select_gpu(devices, "GPU-example-1")["index"], 1)
 
     def test_unknown_or_incompatible_devices_do_not_silently_fallback(self) -> None:
@@ -42,14 +46,16 @@ class GpuSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_gpu([make_device(0, "unknown")], "0")
         with self.assertRaises(ValueError):
-            select_gpu([make_device(0, "NVIDIA A800-SXM4-80GB")], "0", "rtx")
+            select_gpu([make_device(0, "NVIDIA A800-SXM4-80GB", capability="8.0")], "0", "rtx")
+        with self.assertRaises(ValueError):
+            select_gpu([make_device(0, "NVIDIA RTX 4090")], "0", "cuda")
         with self.assertRaises(ValueError):
             select_gpu([make_device(0, "NVIDIA RTX 4090")], "9")
 
     def test_inventory_is_parsed_from_one_bounded_nvidia_query(self) -> None:
         """Read physical ordinals, UUIDs and driver versions from CSV fields."""
         response = subprocess.CompletedProcess([], 0,
-            stdout="3, GPU-selected, NVIDIA A100-SXM4-80GB, 535.161.08, 81920, 7\n")
+            stdout="3, GPU-selected, NVIDIA A100-SXM4-80GB, 535.161.08, 81920, 7, 8.0\n")
         with patch("deployment.detect_gpu.subprocess.run", return_value=response) as command:
             device = read_gpus()[0]
         self.assertEqual((device["index"], device["uuid"], device["memory_used_mib"]), (3, "GPU-selected", 7))
@@ -70,7 +76,7 @@ class LauncherTests(unittest.TestCase):
                 tools.mkdir()
                 smi = tools / "nvidia-smi"
                 smi.write_text("#!/bin/sh\necho '"
-                               f"{gpu}, GPU-example-{gpu}, NVIDIA GeForce RTX 4090, 580.95.05, 24564, 0'\n")
+                               f"{gpu}, GPU-example-{gpu}, NVIDIA GeForce RTX 4090, 580.95.05, 24564, 0, 8.9'\n")
                 smi.chmod(0o755)
                 runtime = root / "official"
                 runtime.mkdir()
@@ -100,7 +106,7 @@ class LauncherTests(unittest.TestCase):
             tools.mkdir()
             smi = tools / "nvidia-smi"
             smi.write_text("#!/bin/sh\ncase \"$*\" in\n*--query-gpu=driver_version*) echo 550.54.15;;\n"
-                           "*) echo '3, GPU-example-3, NVIDIA A800-SXM4-80GB, 550.54.15, 81920, 5';;\nesac\n")
+                           "*) echo '3, GPU-example-3, NVIDIA A800-SXM4-80GB, 550.54.15, 81920, 5, 8.0';;\nesac\n")
             smi.chmod(0o755)
             runtime = root / "runtime"
             for path in ("packages/isaacsim", "render-packages/mitsuba"):

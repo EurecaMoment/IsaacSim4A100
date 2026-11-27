@@ -11,13 +11,14 @@ action="${1:-detect}"
 [[ $# = 0 ]] || shift
 case "$action" in
     detect) exec python3 "$repo_dir/deployment/detect_gpu.py" "$@" ;;
-    prepare|smoke|serve) ;;
-    *) echo 'Usage: bash deploy.sh detect|prepare|smoke|serve [service arguments]' >&2; exit 2 ;;
+    prepare|smoke|serve|prepare-grpc|serve-grpc) ;;
+    *) echo 'Usage: bash deploy.sh detect|prepare|smoke|serve|prepare-grpc|serve-grpc [arguments]' >&2; exit 2 ;;
 esac
 selection="$(python3 "$repo_dir/deployment/detect_gpu.py" --format shell)"
 eval "$selection"
 export ISAACSIM_PORT="${ISAACSIM_PORT:-8321}"
 export ISAACSIM_HOST="${ISAACSIM_HOST:-127.0.0.1}"
+export ISAACSIM_GRPC_PORT="${ISAACSIM_GRPC_PORT:-18500}"
 export ISAACSIM_STATE_ROOT="${ISAACSIM_STATE_ROOT:-$repo_dir/state}"
 printf 'GPU %s: %s -> %s backend (driver %s)\n' \
     "$ISAACSIM_GPU_INDEX" "$ISAACSIM_GPU_NAME" "$ISAACSIM_GPU_BACKEND" "$ISAACSIM_GPU_DRIVER"
@@ -43,6 +44,13 @@ if [[ "$ISAACSIM_GPU_BACKEND" = rtx ]]; then
             ;;
         smoke) exec bash "$repo_dir/rtx4090/run.sh" --smoke --output "$ISAACSIM_STATE_ROOT/smoke" "$@" ;;
         serve) exec bash "$repo_dir/rtx4090/run.sh" --output "$ISAACSIM_STATE_ROOT/jobs" "$@" ;;
+        prepare-grpc) exec bash "$repo_dir/rtx4090_grpc/scripts/system/setup_venv.sh" ;;
+        serve-grpc)
+            export GRPC_HOST="$ISAACSIM_HOST" GRPC_PORT="$ISAACSIM_GRPC_PORT"
+            export RTX4090_STATE_ROOT="$ISAACSIM_STATE_ROOT/grpc/rtx"
+            export RTX4090_GRPC_STATE_ROOT="$ISAACSIM_STATE_ROOT/grpc"
+            exec bash "$repo_dir/rtx4090_grpc/scripts/system/run_server.sh" "$@"
+            ;;
     esac
     exit 0
 fi
@@ -59,6 +67,12 @@ export A100SIM_STATE_ROOT="$ISAACSIM_STATE_ROOT/cuda"
 export A100SIM_RESIDENT_PORT="$ISAACSIM_PORT"
 export A100SIM_GENERIC_PORT="${ISAACSIM_INTERNAL_PORT:-18323}"
 case "$action" in
+    prepare-grpc) exec bash "$repo_dir/a100/serve-grpc.sh" install ;;
+    serve-grpc)
+        export A100SIM_GRPC_LISTEN="$ISAACSIM_HOST:$ISAACSIM_GRPC_PORT"
+        export PYTHONPATH="$repo_dir:$repo_dir/rtx4090_grpc/generated${PYTHONPATH:+:$PYTHONPATH}"
+        exec bash "$repo_dir/a100/serve-grpc.sh" "$@"
+        ;;
     prepare)
         [[ "${OMNI_KIT_ACCEPT_EULA:-}" = YES ]] || {
             echo 'Set OMNI_KIT_ACCEPT_EULA=YES after accepting the NVIDIA terms.' >&2; exit 2;

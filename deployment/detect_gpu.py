@@ -13,11 +13,11 @@ import subprocess
 from typing import Any
 
 
-def classify_gpu(name: str) -> str | None:
-    """Return the known rendering backend for a GPU model, or None when unknown."""
-    normalized = name.upper()
-    if re.search(r"\bA(?:100|800)\b", normalized):
+def classify_gpu(name: str, compute_capability: str) -> str | None:
+    """Route SM 8.0 to the CUDA adapter and known RT hardware to native RTX."""
+    if compute_capability == "8.0":
         return "cuda"
+    normalized = name.upper()
     if "RTX" in normalized or re.search(r"\b(?:L4|L40S?|A10G?|A16|A40)\b", normalized):
         return "rtx"
     return None
@@ -26,16 +26,16 @@ def classify_gpu(name: str) -> str | None:
 def read_gpus() -> list[dict[str, Any]]:
     """Query model and physical identity once, without importing CUDA libraries."""
     result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used",
+        ["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,compute_cap",
          "--format=csv,noheader,nounits"],
         capture_output=True, text=True, check=True, timeout=10,
     )
     devices = []
     for row in csv.reader(io.StringIO(result.stdout), skipinitialspace=True):
-        if len(row) != 6:
+        if len(row) != 7:
             raise ValueError("Unexpected nvidia-smi GPU inventory format")
-        index, uuid, name, driver, total, used = (value.strip() for value in row)
-        devices.append({"index": int(index), "uuid": uuid, "name": name, "driver": driver,
+        index, uuid, name, driver, total, used, capability = (value.strip() for value in row)
+        devices.append({"index": int(index), "uuid": uuid, "name": name, "driver": driver, "compute_capability": capability,
                         "memory_total_mib": int(total), "memory_used_mib": int(used)})
     if not devices:
         raise ValueError("No NVIDIA GPUs were reported")
@@ -47,9 +47,8 @@ def select_gpu(devices: list[dict[str, Any]], selection: str, backend: str = "au
     if backend not in {"auto", "cuda", "rtx"}:
         raise ValueError("ISAACSIM_BACKEND must be auto, cuda or rtx")
     if selection == "auto":
-        candidates = [device for device in devices if classify_gpu(device["name"]) is not None]
-        if backend == "rtx":
-            candidates = [device for device in candidates if classify_gpu(device["name"]) == "rtx"]
+        allowed = {"rtx", "cuda"} if backend == "auto" else {backend}
+        candidates = [device for device in devices if classify_gpu(device["name"], device["compute_capability"]) in allowed]
         if not candidates:
             raise ValueError("No recognized GPU is available; select a physical index and backend explicitly")
         device = min(candidates, key=lambda item: (item["memory_used_mib"], item["index"]))
@@ -58,13 +57,16 @@ def select_gpu(devices: list[dict[str, Any]], selection: str, backend: str = "au
         if len(matches) != 1:
             raise ValueError(f"Physical GPU {selection!r} was not found")
         device = matches[0]
-    known_backend = classify_gpu(device["name"])
+    known_backend = classify_gpu(device["name"], device["compute_capability"])
+    if backend == "cuda" and known_backend != "cuda":
+        raise ValueError(f"The CUDA adapter requires SM 8.0; {device['name']} reports {device['compute_capability']}")
     if known_backend == "cuda" and backend == "rtx":
         raise ValueError(f"{device['name']} has no RT cores; select the cuda backend")
     if backend == "auto" and known_backend is None:
         raise ValueError(f"Unknown RT capability for {device['name']}; set ISAACSIM_BACKEND=rtx or cuda explicitly")
     return {**device, "backend": known_backend if backend == "auto" else backend,
-            "detection": "model_table" if backend == "auto" else "explicit_override"}
+            "detection": ("compute_capability" if known_backend == "cuda" else "model_table")
+            if backend == "auto" else "explicit_override"}
 
 
 def main() -> None:
@@ -84,7 +86,7 @@ def main() -> None:
     if args.format == "json":
         print(json.dumps(device, ensure_ascii=False, indent=2))
     else:
-        for field in ("index", "uuid", "name", "driver", "backend"):
+        for field in ("index", "uuid", "name", "driver", "backend", "compute_capability"):
             print(f"export ISAACSIM_GPU_{field.upper()}={shlex.quote(str(device[field]))}")
 
 
