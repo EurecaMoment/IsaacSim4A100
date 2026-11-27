@@ -70,6 +70,8 @@ def _body_to_dict(body: Any) -> dict[str, Any]:
         item["color"] = _vec3(body.color)
     if body.HasField("asset"):
         item["asset"] = body.asset
+    if body.HasField("asset_id"):
+        item["asset_id"] = body.asset_id
     return item
 
 
@@ -85,6 +87,17 @@ def _render_to_dict(render: Any) -> dict[str, Any]:
             item[field] = float(getattr(render, field))
     if render.HasField("target"):
         item["target"] = _vec3(render.target)
+    if render.views:
+        views = []
+        for view in render.views:
+            data = {"id": view.id}
+            for name in ("eye", "target", "up"):
+                if view.HasField(name):
+                    data[name] = _vec3(getattr(view, name))
+            if view.HasField("fov_y_degrees"):
+                data["fov_y_degrees"] = view.fov_y_degrees
+            views.append(data)
+        item["views"] = views
     if render.HasField("lighting"):
         lighting: dict[str, Any] = {}
         if render.lighting.HasField("dome"):
@@ -157,6 +170,8 @@ def health_to_proto(record: dict[str, Any]) -> Any:
     message.artifacts_root = str(record.get("artifacts_root") or "")
     message.artifacts_free_bytes = _to_int(record.get("artifacts_free_bytes"))
     message.retention_seconds = _to_int(record.get("retention_seconds"))
+    message.max_views = _to_int(record.get("max_views"))
+    message.capabilities.extend(record.get("capabilities") or [])
     return message
 
 

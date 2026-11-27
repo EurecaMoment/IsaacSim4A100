@@ -81,6 +81,8 @@ message BodySpec {
 
   // mesh only: server-side absolute directory containing mesh.npz.
   optional string asset = 9;
+  // Registered directory under the service asset root, containing mesh.npz.
+  optional string asset_id = 10;
 }
 
 message LightSpec {
@@ -97,6 +99,14 @@ message LightingSpec {
   LightSpec dome = 1;
   LightSpec key = 2;
   repeated LightSpec fills = 3;
+}
+
+message CameraView {
+  string id = 1;
+  Vec3 eye = 2;
+  Vec3 target = 3;
+  Vec3 up = 4;
+  optional double fov_y_degrees = 5;
 }
 
 message RenderSpec {
@@ -116,6 +126,8 @@ message RenderSpec {
   Vec3 target = 8;
   optional double gaussian_gain = 9;
   LightingSpec lighting = 10;
+  // Perspective cameras rendered from the same rigid-body snapshot.
+  repeated CameraView views = 11;
 }
 
 message CaptureSpec {
@@ -330,4 +342,6 @@ message HealthResponse {
   string artifacts_root = 22;
   uint64 artifacts_free_bytes = 23;
   uint32 retention_seconds = 24;
+  uint32 max_views = 25;
+  repeated string capabilities = 26;
 }

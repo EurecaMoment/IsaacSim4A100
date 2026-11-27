@@ -386,9 +386,9 @@ class JobManager:
             except ValueError:
                 continue
             manifest.append({
-                "artifact_id": _artifact_id(str(rel)),
+                "artifact_id": _artifact_id(rel.as_posix()),
                 "name": path.name,
-                "relative_path": str(rel),
+                "relative_path": rel.as_posix(),
                 "size_bytes": path.stat().st_size,
                 "sha256": _sha256_file(path),
                 "media_type": _media_type(path.suffix),

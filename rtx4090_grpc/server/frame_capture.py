@@ -22,7 +22,10 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, Vt
 
 from rtx4090.service import RtxQueue
 
-from a100sim.service_queue import finite, integer, persist
+from a100sim.materials import author_material, read_mesh_channels, read_mesh_colors
+from a100sim.service_queue import ASSET_ROOT, persist
+from a100sim.views import MAX_VIEWS, camera_views, prepare_capture
+from .views import registered_mesh, visible_objects
 
 
 class RtxQueueWithFrameCapture(RtxQueue):
@@ -34,6 +37,13 @@ class RtxQueueWithFrameCapture(RtxQueue):
 
     def _manager(self):
         return getattr(self, "manager", None)
+
+    def health(self):
+        return super().health() | {
+            "max_views": MAX_VIEWS,
+            "capabilities": ["multiview_final", "multiview_frames", "metric_depth",
+                             "semantic_masks", "visible_bboxes", "registered_mesh_npz"],
+        }
 
     def _progress(self, **kw) -> None:
         """向 JobManager 上报进度（manager 未就绪时为空操作）。"""
@@ -100,6 +110,11 @@ class RtxQueueWithFrameCapture(RtxQueue):
         # 先把 capture 摘出来，让上游 prepare 能过 unknown 字段检查
         capture_value = value.get("capture")
         upstream_input = {k: v for k, v in value.items() if k != "capture"}
+        render = upstream_input.get("render")
+        views = None
+        if isinstance(render, dict) and "views" in render:
+            views = camera_views(render["views"])
+            upstream_input["render"] = {k: v for k, v in render.items() if k != "views"}
 
         # mass 语义预处理（proto 约定：省略即静态体）：
         # 上游把省略的 mass 默认成 1.0 且拒绝 0，这里在调用上游前抹平差异。
@@ -112,46 +127,32 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 for body in raw_bodies
             ]
             raw_bodies = upstream_input["bodies"]
+            upstream_input["bodies"] = [
+                registered_mesh(ASSET_ROOT, body) if isinstance(body, dict) and "asset_id" in body else body
+                for body in raw_bodies
+            ]
 
         request = super().prepare(upstream_input)
+        if views:
+            request["render"]["views"] = views
 
         # 标记静态体：原始请求未提供 mass，或显式 mass=0（已在上一步移除）
         for raw_body, item in zip(raw_bodies or [], request["bodies"]):
             item["static"] = not ("mass" in raw_body)
+            if "asset_id" in raw_body:
+                item["asset_id"] = raw_body["asset_id"]
 
         # 再用我们自己的 prepare_capture 解析 capture（含 render 字段）
         request["capture"] = self.prepare_capture(capture_value, request["steps"])
+        if request["capture"] and not request["render"]:
+            raise ValueError("capture requires a render specification")
         return request
 
     # ------------------------------------------------------------------
     # 1. 覆盖 prepare_capture：capture 存在即强制逐帧渲染
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def prepare_capture(value, steps):
-        if value is None:
-            return None
-        if not isinstance(value, dict):
-            raise ValueError("capture must be an object")
-        extra = set(value) - {"every", "frames"}
-        if extra:
-            raise ValueError("Unsupported capture fields: " + ", ".join(sorted(extra)))
-        every, frames = value.get("every"), value.get("frames")
-        if every is None and frames is None:
-            raise ValueError("capture requires 'every' or 'frames'")
-        points = set()
-        if every is not None:
-            every = integer(every, "capture.every", 1, steps)
-            points.update(range(every, steps + 1, every))
-        if frames is not None:
-            if not isinstance(frames, list) or not frames:
-                raise ValueError("capture.frames must be a non-empty array")
-            if len(frames) > 1200:
-                raise ValueError("capture.frames accepts at most 1200 entries")
-            for item in frames:
-                points.add(integer(item, "capture.frames[]", 1, steps))
-        points.add(steps)  # 尾帧始终保留，与 state.npz 对齐
-        return {"every": every, "frames": sorted(points), "render": True}
+    prepare_capture = staticmethod(prepare_capture)
 
     # ------------------------------------------------------------------
     # 2. 覆盖 process：完整骨架复用上游 PhysicsQueue.process()，
@@ -196,14 +197,14 @@ class RtxQueueWithFrameCapture(RtxQueue):
             else:
                 UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(body["mass"])
             visual_path = path + "/Visual"
+            channels = {}
             if body["shape"] == "mesh":
                 asset = Path(body["asset"])
                 with np.load(asset / "mesh.npz", allow_pickle=False) as data:
                     vertices, faces = data["vertices"], data["faces"]
-                    normals, colors = data["normals"], data["colors"]
-                    if "colors_linear" not in data:
-                        colors = np.where(colors <= .04045, colors / 12.92,
-                                          ((colors + .055) / 1.055) ** 2.4)
+                    normals = data["normals"]
+                    colors = read_mesh_colors(data, len(vertices))
+                    channels = read_mesh_channels(data, len(vertices))
                 visual = UsdGeom.Mesh.Define(stage, visual_path)
                 visual.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(vertices.astype(np.float32)))
                 visual.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(faces), 3, np.int32)))
@@ -225,6 +226,8 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 visual.CreateSizeAttr(1)
                 visual.AddScaleOp().Set(Gf.Vec3f(*body["size"]))
                 visual.CreateDisplayColorAttr([Gf.Vec3f(*body["color"])])
+            if channels or body.get("material"):
+                author_material(visual, body.get("material", {}), channels)
             UsdPhysics.CollisionAPI.Apply(visual.GetPrim())
 
         physics = None
@@ -264,13 +267,15 @@ class RtxQueueWithFrameCapture(RtxQueue):
                         frame_dir = frames_dir / f"frame_{frame:06d}"
                         frame_dir.mkdir(parents=True, exist_ok=True)
                         state_npz = frame_dir / "state.npz"
+                        poses = rigids.get_transforms().numpy().copy()
                         np.savez(state_npz,
                                  frame=np.int32(frame),
                                  time=np.float64(frame * request["dt"]),
-                                 poses_xyzw=rigids.get_transforms().numpy().copy(),
+                                 body_ids=np.asarray(self.body_ids), poses_xyzw=poses,
                                  velocities=rigids.get_velocities().numpy().copy())
                         record: dict = {"frame": frame, "state_npz": str(state_npz)}
-                        record.update(self._render_one_frame(frame, frame_dir, rigids, paths, frame_capture_ctx))
+                        self._write_poses(stage, paths, poses)
+                        record.update(self._render_one_frame(frame, frame_dir, frame_capture_ctx))
                         frame_records.append(record)
                         self._progress(frames_done=len(frame_records))
                 finally:
@@ -288,20 +293,15 @@ class RtxQueueWithFrameCapture(RtxQueue):
             actual_paths = paths
             bodies = []
             by_path = {path: body for path, body in zip(paths, request["bodies"])}
+            self._write_poses(stage, actual_paths, poses)
             for path, pose, velocity in zip(actual_paths, poses, velocities):
-                position = Gf.Vec3d(*[float(v) for v in pose[:3]])
-                qx, qy, qz, qw = [float(v) for v in pose[3:7]]
-                matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(qw, Gf.Vec3d(qx, qy, qz)))
-                matrix.SetTranslateOnly(position)
-                xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-                xform.ClearXformOpOrder()
-                xform.AddTransformOp().Set(matrix)
                 body_spec = by_path[path]
                 # 静态体（运动学）速度语义固定为 0
                 out_velocity = [0.0] * 6 if body_spec.get("static") else velocity.tolist()
                 bodies.append({"id": body_spec["id"], "prim_path": path,
                                "pose_xyzw": pose.tolist(), "velocity": out_velocity})
-            np.savez(directory / "state.npz", poses_xyzw=poses, velocities=velocities)
+            np.savez(directory / "state.npz", body_ids=np.asarray(self.body_ids),
+                     poses_xyzw=poses, velocities=velocities)
             result = {"isaac_sim": self.runtime_version, "physics_device": str(physics.view.device),
                       "physical_gpu": self.health()["physical_gpu"], "native_rtx": self.native_rtx,
                       "cpu_fallback": False, "bodies": bodies, "rigid_bodies": len(bodies),
@@ -320,13 +320,28 @@ class RtxQueueWithFrameCapture(RtxQueue):
             if self.close_physics_before_capture:
                 physics.close()
                 physics = None
+                self._write_poses(stage, actual_paths, poses)
 
             # ------- 尾帧渲染（取消时跳过，已写出的帧产物仍可下载）-------
             if capture and not cancelled:
                 self._progress(phase="rendering")
                 image = directory / "render.png"
-                result["render"] = self.capture_scene(stage, capture, image)
-                result["image"] = str(image)
+                if capture.get("views"):
+                    if frame_records:
+                        rendered = frame_records[-1]
+                    else:
+                        ctx = self._init_frame_render(stage, request)
+                        try:
+                            rendered = self._render_one_frame(request["steps"], directory, ctx)
+                        finally:
+                            self._shutdown_frame_render(ctx)
+                    result["render"] = {**rendered, "native_rtx": True, "renderer": "RayTracedLighting",
+                                        "backend": "native_rtx", "size": capture["size"],
+                                        "requested_spp": capture["spp"], "rt_subframes": max(8, capture["spp"])}
+                    result["image"] = rendered["image"]
+                else:
+                    result["render"] = self.capture_scene(stage, capture, image)
+                    result["image"] = str(image)
 
             self._progress(phase="writing_artifacts")
             stage.GetRootLayer().Export(str(directory / "scene.usdc"))
@@ -440,51 +455,60 @@ class RtxQueueWithFrameCapture(RtxQueue):
 
         size = render["size"]
         print(f"RTX_FRAME_INIT size={size} body_count={len(self.body_ids)}", flush=True)
-        product = rep.create.render_product("/World/Camera", (size, size))
-        annotators = {
-            "rgb": rep.AnnotatorRegistry.get_annotator("rgb"),
-            "depth": rep.AnnotatorRegistry.get_annotator("distance_to_image_plane"),
-            "semantic": rep.AnnotatorRegistry.get_annotator("semantic_segmentation", init_params={"colorize": False}),
-        }
-        for annotator in annotators.values():
-            annotator.attach([product])
-
-        # Warmup
-        print("RTX_FRAME_WARMUP", flush=True)
-        for _ in range(24):
-            self.app.update()
-
-        rt_subframes = max(8, render.get("spp", 8))
-        ctx = {
-            "stage": stage,
-            "product": product,
-            "annotators": annotators,
-            "rt_subframes": rt_subframes,
-            "size": size,
-        }
-        print(f"RTX_FRAME_READY rt_subframes={rt_subframes}", flush=True)
+        ctx = {"products": [], "size": size, "rt_subframes": max(8, render.get("spp", 8))}
+        try:
+            for index, view in enumerate(render.get("views") or [None]):
+                camera_path, calibration = "/World/Camera", None
+                if view is not None:
+                    camera_path = f"/World/Cameras/C{index:03d}"
+                    calibration = self._author_camera(stage, camera_path, view, size)
+                product = rep.create.render_product(camera_path, (size, size))
+                item = {"product": product, "calibration": calibration, "annotators": {}}
+                ctx["products"].append(item)
+                for key, annotator_name in (("rgb", "rgb"), ("depth", "distance_to_image_plane"),
+                                            ("semantic", "semantic_segmentation")):
+                    params = {"init_params": {"colorize": False}} if key == "semantic" else {}
+                    annotator = rep.AnnotatorRegistry.get_annotator(annotator_name, **params)
+                    annotator.attach([product])
+                    item["annotators"][key] = annotator
+            for _ in range(24):
+                self.app.update()
+        except BaseException:
+            self._shutdown_frame_render(ctx)
+            raise
         return ctx
 
-    def _render_one_frame(self, frame_idx: int, frame_dir: Path, rigids: Any,
-                          paths: list, ctx: dict) -> dict:
-        """写回 PhysX pose → RTX 渲染 → 读 annotators → 写盘。"""
-        import omni.replicator.core as rep
-        from pxr import Gf, UsdGeom
+    @staticmethod
+    def _author_camera(stage, path, view, size):
+        camera = UsdGeom.Camera.Define(stage, path)
+        world = Gf.Matrix4d().SetLookAt(Gf.Vec3d(*view["eye"]), Gf.Vec3d(*view["target"]),
+                                        Gf.Vec3d(*view["up"])).GetInverse()
+        camera.AddTransformOp().Set(world)
+        aperture = 70 * math.tan(math.radians(view["fov_y_degrees"]) / 2)
+        camera.CreateFocalLengthAttr(35)
+        camera.CreateHorizontalApertureAttr(aperture)
+        camera.CreateVerticalApertureAttr(aperture)
+        focal_px = 35 * size / aperture
+        return {
+            **view, "prim_path": path, "width": size, "height": size,
+            "K": [[focal_px, 0, size / 2], [0, focal_px, size / 2], [0, 0, 1]],
+            "pixel_coordinates": "origin at upper left image edge; first pixel center (0.5,0.5)",
+            "usd_camera_to_world": np.array(world).T.tolist(),
+            "camera_convention": "column vectors; USD +X right, +Y up, -Z forward",
+        }
 
-        stage = ctx["stage"]
-
-        # 1. PhysX tensor → USD Stage（RTX 读 USD，不读 PhysX tensor）
-        poses = rigids.get_transforms().numpy().copy()
+    @staticmethod
+    def _write_poses(stage, paths, poses):
         for path, pose in zip(paths, poses):
-            position = Gf.Vec3d(*[float(v) for v in pose[:3]])
-            qx, qy, qz, qw = [float(v) for v in pose[3:7]]
-            matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(qw, Gf.Vec3d(qx, qy, qz)))
-            matrix.SetTranslateOnly(position)
-            xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-            xform.ClearXformOpOrder()
-            xform.AddTransformOp().Set(matrix)
+            prim = stage.GetPrimAtPath(path)
+            prim.GetAttribute("xformOp:translate").Set(Gf.Vec3d(*map(float, pose[:3])))
+            x, y, z, w = map(float, pose[3:7])
+            prim.GetAttribute("xformOp:orient").Set(Gf.Quatf(w, Gf.Vec3f(x, y, z)))
 
-        # 2. RTX 渲染（pause_timeline 防 timeline 推进）
+    def _render_one_frame(self, frame_idx: int, directory: Path, ctx: dict) -> dict:
+        import omni.replicator.core as rep
+
+        # All render products sample the same frozen USD poses in one orchestrator step.
         task = asyncio.ensure_future(rep.orchestrator.step_async(
             rt_subframes=ctx["rt_subframes"], delta_time=0.0, pause_timeline=True))
         deadline = time.monotonic() + 120
@@ -495,13 +519,28 @@ class RtxQueueWithFrameCapture(RtxQueue):
                 raise TimeoutError(f"RTX frame {frame_idx} timed out")
         task.result()
 
-        # 3. 读 annotators + 写盘
-        rgb = np.asarray(ctx["annotators"]["rgb"].get_data())[:, :, :3].copy()
-        depth = np.asarray(ctx["annotators"]["depth"].get_data(), dtype=np.float32).squeeze()
-        segmentation = ctx["annotators"]["semantic"].get_data()
-        semantic = np.asarray(segmentation["data"], dtype=np.uint32).squeeze()
+        results = {}
+        for product in ctx["products"]:
+            calibration = product["calibration"]
+            if calibration is None:
+                return self._read_camera(frame_idx, directory, ctx["size"], product["annotators"])
+            view_id = calibration["id"]
+            view_dir = directory / "views" / view_id
+            view_dir.mkdir(parents=True, exist_ok=True)
+            paths = self._read_camera(frame_idx, view_dir, ctx["size"], product["annotators"], view_id)
+            persist(view_dir / "camera.json", {**calibration, "frame": frame_idx})
+            results[view_id] = {**paths, "camera": str(view_dir / "camera.json"),
+                                "annotations": str(view_dir / "annotations.json")}
+        return {**next(iter(results.values())), "views": results}
 
-        size = ctx["size"]
+    @staticmethod
+    def _read_camera(frame_idx: int, frame_dir: Path, size: int, annotators: dict, view_id=None) -> dict:
+
+        # 3. 读 annotators + 写盘
+        rgb = np.asarray(annotators["rgb"].get_data())[:, :, :3].copy()
+        depth = np.asarray(annotators["depth"].get_data(), dtype=np.float32).squeeze()
+        segmentation = annotators["semantic"].get_data()
+        semantic = np.asarray(segmentation["data"], dtype=np.uint32).squeeze()
         if rgb.shape[:2] != (size, size) or depth.shape != (size, size) or semantic.shape != (size, size):
             raise RuntimeError(f"Frame {frame_idx} bad shapes: rgb={rgb.shape} depth={depth.shape} sem={semantic.shape}")
 
@@ -510,6 +549,13 @@ class RtxQueueWithFrameCapture(RtxQueue):
         np.save(frame_dir / "depth_m.npy", depth)
         np.save(frame_dir / "semantic_ids.npy", semantic)
         persist(frame_dir / "semantic_labels.json", segmentation.get("info", {}))
+        if view_id is not None:
+            labels = segmentation.get("info", {}).get("idToLabels", {})
+            persist(frame_dir / "annotations.json", {
+                "frame": frame_idx, "view_id": view_id, "state": "../../state.npz",
+                "depth_convention": "metric camera-forward distance",
+                "objects": visible_objects(semantic, labels),
+            })
 
         print(f"RTX_FRAME_DONE frame={frame_idx} rgb_mean={rgb.mean():.1f}", flush=True)
         return {
@@ -520,9 +566,13 @@ class RtxQueueWithFrameCapture(RtxQueue):
         }
 
     def _shutdown_frame_render(self, ctx: dict) -> None:
-        try:
-            for annotator in ctx.get("annotators", {}).values():
-                annotator.detach([ctx["product"]])
-            ctx["product"].destroy()
-        except Exception as exc:
-            print(f"RTX_FRAME_SHUTDOWN_WARN {exc}", flush=True)
+        for item in reversed(ctx["products"]):
+            for annotator in item["annotators"].values():
+                try:
+                    annotator.detach([item["product"]])
+                except Exception as exc:
+                    print(f"RTX_ANNOTATOR_DETACH_WARN {exc}", flush=True)
+            try:
+                item["product"].destroy()
+            except Exception as exc:
+                print(f"RTX_PRODUCT_DESTROY_WARN {exc}", flush=True)
