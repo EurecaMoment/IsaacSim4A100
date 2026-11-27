@@ -16,8 +16,8 @@ import grpc
 from google.protobuf.empty_pb2 import Empty
 from google.protobuf.json_format import MessageToDict
 
-from a100sim.rpc.v1 import simulator_pb2 as pb
-from a100sim.rpc.v1 import simulator_pb2_grpc as rpc
+from rtx4090_grpc.server.rpc import simulation_pb2 as wire, simulation_pb2_grpc as rpc
+from isaacsim_rpc.v1 import native_pb2 as pb
 
 
 def cube_glb() -> bytes:
@@ -104,7 +104,7 @@ async def validate(arguments: argparse.Namespace) -> dict[str, Any]:
     report: dict[str, Any] = {"scope": "public gRPC live simulator acceptance", "checks": {}, "skipped": {}}
     try:
         await asyncio.wait_for(channel.channel_ready(), timeout=10)
-        client = rpc.SimulatorStub(channel)
+        client = rpc.SimulationServiceStub(channel)
         capabilities = await client.GetCapabilities(Empty(), metadata=metadata, timeout=10)
         available = {item.name for item in capabilities.capabilities if item.availability == pb.AVAILABLE}
         report["capabilities"] = MessageToDict(capabilities, preserving_proto_field_name=True)
@@ -123,11 +123,13 @@ async def validate(arguments: argparse.Namespace) -> dict[str, Any]:
             if arguments.skip_workflows and name in ("newton", "import_robot", "convert_asset"):
                 report["skipped"][key] = "Workflow acceptance was explicitly skipped"
                 return None
-            job = await client.SubmitTask(
-                pb.SubmitTaskRequest(request_id=uuid.uuid4().hex, **{name: message}), metadata=metadata, timeout=10
-            )
-            async for job in client.WatchJob(pb.WatchJobRequest(job_id=job.job_id), metadata=metadata, timeout=600):
-                pass
+            handle = await client.SubmitJob(wire.SubmitJobRequest(request_id=uuid.uuid4().hex,
+                native_task=pb.SubmitTaskRequest(**{name: message})), metadata=metadata, timeout=10)
+            job = None
+            async for envelope in client.WatchJob(wire.GetJobRequest(job_id=handle.id), metadata=metadata, timeout=600):
+                job = envelope.native_job
+            if job is None or job.job_id != handle.id:
+                raise RuntimeError("Missing terminal native job receipt")
             if job.state != pb.SUCCEEDED:
                 raise RuntimeError(f"{key} failed: {job.failure.code} {job.failure.message}")
             report["checks"][key] = {
@@ -139,7 +141,7 @@ async def validate(arguments: argparse.Namespace) -> dict[str, Any]:
                 digest = hashlib.sha256()
                 size = 0
                 async for chunk in client.DownloadArtifact(
-                    pb.DownloadRequest(job_id=job.job_id, artifact_id=artifact.artifact_id),
+                    wire.DownloadArtifactRequest(job_id=job.job_id, artifact_id=artifact.artifact_id),
                     metadata=metadata,
                     timeout=120,
                 ):

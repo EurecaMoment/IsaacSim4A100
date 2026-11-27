@@ -23,8 +23,8 @@ from a100sim.rpc.backend import SimulatorBackend
 from a100sim.rpc.config import Settings
 from a100sim.rpc.jobs import JobManager
 from a100sim.rpc.server import build_server
-from a100sim.rpc.v1 import simulator_pb2 as pb
-from a100sim.rpc.v1 import simulator_pb2_grpc as rpc
+from rtx4090_grpc.server.rpc import simulation_pb2 as wire, simulation_pb2_grpc as rpc
+from isaacsim_rpc.v1 import native_pb2 as pb
 
 
 def summarize(values: list[float]) -> dict[str, float]:
@@ -116,7 +116,7 @@ def make_request(workload: str) -> pb.SubmitTaskRequest:
 
 
 async def measure(
-    client: rpc.SimulatorStub, *, workload: str, count: int, concurrency: int, metadata: tuple[Any, ...], timeout: float
+    client: rpc.SimulationServiceStub, *, workload: str, count: int, concurrency: int, metadata: tuple[Any, ...], timeout: float
 ) -> dict[str, Any]:
     """Measure admission, completion, queueing and simulator execution independently."""
     semaphore = asyncio.Semaphore(concurrency)
@@ -140,12 +140,15 @@ async def measure(
                     admission.append(time.perf_counter() - started)
                 else:
                     request = make_request(workload)
-                    job = await client.SubmitTask(request, metadata=metadata, timeout=timeout)
+                    handle = await client.SubmitJob(wire.SubmitJobRequest(request_id=request.request_id,
+                        native_task=request), metadata=metadata, timeout=timeout)
                     admission.append(time.perf_counter() - started)
-                    async for job in client.WatchJob(
-                        pb.WatchJobRequest(job_id=job.job_id), metadata=metadata, timeout=timeout
-                    ):
-                        pass
+                    job = None
+                    async for envelope in client.WatchJob(wire.GetJobRequest(job_id=handle.id),
+                                                          metadata=metadata, timeout=timeout):
+                        job = envelope.native_job
+                    if job is None or job.job_id != handle.id:
+                        raise RuntimeError("Missing terminal native job receipt")
                     if job.state != pb.SUCCEEDED:
                         code = job.failure.code or pb.JobState.Name(job.state)
                         failed[code] = failed.get(code, 0) + 1
@@ -211,7 +214,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             else (grpc.aio.insecure_channel(target))
         )
         await asyncio.wait_for(channel.channel_ready(), timeout=10)
-        client = rpc.SimulatorStub(channel)
+        client = rpc.SimulationServiceStub(channel)
         capabilities = await client.GetCapabilities(Empty(), metadata=metadata, timeout=10)
         measurements = []
         for workload in arguments.workloads:
