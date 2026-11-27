@@ -171,6 +171,8 @@ def health_to_proto(record: dict[str, Any]) -> Any:
     message.artifacts_free_bytes = _to_int(record.get("artifacts_free_bytes"))
     message.retention_seconds = _to_int(record.get("retention_seconds"))
     message.max_views = _to_int(record.get("max_views"))
+    message.max_image_size = _to_int(record.get("max_image_size"))
+    message.max_samples_per_pixel = _to_int(record.get("max_samples_per_pixel"))
     message.capabilities.extend(record.get("capabilities") or [])
     return message
 

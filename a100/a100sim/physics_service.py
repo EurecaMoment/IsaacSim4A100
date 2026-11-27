@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import MAX_IMAGE_SIZE, MAX_SAMPLES_PER_PIXEL
 from .service_queue import JobQueue, asset_directory, finite, integer, persist, start_http
 from .materials import author_material, read_mesh_channels, read_mesh_colors, validate_material
 from .network import require_loopback
@@ -165,8 +166,8 @@ class PhysicsQueue(JobQueue):
                         if field in spec:
                             vector(spec[field], "lighting.fill.target")
             render = {"kind": render.get("kind", "mesh"),
-                      "size": integer(render.get("size", 256), "render.size", 64, 2048),
-                      "spp": integer(render.get("spp", 8), "render.spp", 1, 1024),
+                      "size": integer(render.get("size", 256), "render.size", 64, MAX_IMAGE_SIZE),
+                      "spp": integer(render.get("spp", 8), "render.spp", 1, MAX_SAMPLES_PER_PIXEL),
                       "seed": integer(render.get("seed", 42), "render.seed", 0, 2147483647),
                       "azimuth": finite(render.get("azimuth", 35), "azimuth", -36000, 36000),
                       "elevation": finite(render.get("elevation", 20), "elevation", -80, 80),

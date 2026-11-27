@@ -291,7 +291,7 @@ curl --fail 'http://127.0.0.1:8321/jobs/<job-id>?wait_ms=30000'
 python3 examples/client.py examples/cube.json --url http://127.0.0.1:18323 --wait-ms 0
 ```
 
-请求包含 `bodies`、`steps`、`dt`、`gravity`、`ground` 和可选的 `render`。当前主要限制：1–256 个刚体、1–1200 步、正方形图像 64–1024 像素、1–256 spp，队列容量默认 64。方块使用 `size`，球使用 `radius`，mesh 使用服务端绝对 `asset` 目录；旋转是 `orientation_xyzw`。
+请求包含 `bodies`、`steps`、`dt`、`gravity`、`ground` 和可选的 `render`。通用仿真支持 1–256 个刚体、1–1200 步、边长 64–2048 像素的正方形图像以及 1–1024 的 `render.spp`，队列容量默认 64。统一 gRPC 接口的 `Health.max_image_size` 和 `Health.max_samples_per_pixel` 返回当前服务的两个渲染上限。Mitsuba 按每像素采样数渲染，RTX 使用实时渲染子帧，最少执行 8 个子帧。方块使用 `size`，球使用 `radius`，mesh 使用服务端绝对 `asset` 目录，旋转使用 `orientation_xyzw`。
 
 `mesh.npz` 必须包含 `vertices`、`normals`、`faces`、`colors`。颜色是 0–1 RGB；存在 `colors_linear` 键时按线性颜色读取，否则由 sRGB 解码。细节见 [physics_service.py](a100/a100sim/physics_service.py) 的 `PhysicsQueue.prepare()`。
 

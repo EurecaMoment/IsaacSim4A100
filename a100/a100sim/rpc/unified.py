@@ -11,6 +11,7 @@ from pathlib import Path
 
 import grpc
 
+from a100sim import MAX_IMAGE_SIZE, MAX_SAMPLES_PER_PIXEL
 from a100sim.rpc.codec import Task, validate_numbers
 from a100sim.rpc.errors import ServiceError
 from a100sim.rpc.v1 import simulator_pb2 as legacy
@@ -97,6 +98,7 @@ class UnifiedService(rpc.simulation_pb2_grpc.SimulationServiceServicer):
                 "render_backend": variant, "renderer": "Mitsuba", "supported_shapes": ["cube", "sphere", "mesh"],
                 "annotators": ["rgb", "depth_m", "semantic_ids", "instance_ids"], "api_version": "1.0.0",
                 "max_views": 32,
+                "max_image_size": MAX_IMAGE_SIZE, "max_samples_per_pixel": MAX_SAMPLES_PER_PIXEL,
                 "capabilities": ["multiview_final", "multiview_frames", "metric_depth", "instance_ids",
                                  "semantic_masks", "visible_bboxes", "registered_mesh_npz"],
                 "uptime_seconds": time.monotonic() - self.manager.started_at,

@@ -25,6 +25,7 @@ from rtx4090.service import RtxQueue
 
 from a100sim.materials import author_material, read_mesh_channels, read_mesh_colors
 from a100sim.service_queue import ASSET_ROOT, persist
+from a100sim import MAX_IMAGE_SIZE, MAX_SAMPLES_PER_PIXEL
 from a100sim.views import MAX_VIEWS, camera_views, prepare_capture
 from .views import registered_mesh, visible_objects
 
@@ -42,6 +43,7 @@ class RtxQueueWithFrameCapture(RtxQueue):
     def health(self):
         return super().health() | {
             "max_views": MAX_VIEWS,
+            "max_image_size": MAX_IMAGE_SIZE, "max_samples_per_pixel": MAX_SAMPLES_PER_PIXEL,
             "capabilities": ["multiview_final", "multiview_frames", "metric_depth",
                              "semantic_masks", "instance_masks", "visible_bboxes", "registered_mesh_npz"],
         }
