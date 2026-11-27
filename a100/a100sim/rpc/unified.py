@@ -140,6 +140,9 @@ class UnifiedService(rpc.simulation_pb2_grpc.SimulationServiceServicer):
             capabilities.append(native.Capability(
                 name="native_task_api", availability=native.AVAILABLE, scope="A100 typed simulation tasks"
             ))
+            upload = native.Capability(name="asset_upload", availability=native.AVAILABLE, scope="per file")
+            upload.details.update({"max_upload_bytes": self.manager.settings.max_upload_bytes})
+            capabilities.append(upload)
             if os.environ.get("A100SIM_SCENE_URL"):
                 health = await self.manager.backend.health()
                 scene_ready = health.get("scenes", {}).get("status") == "ready"

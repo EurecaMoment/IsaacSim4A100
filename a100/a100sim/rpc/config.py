@@ -61,6 +61,7 @@ class Settings:
             listen=os.environ.get("A100SIM_GRPC_LISTEN") or "127.0.0.1:50051",
             capacity=int(os.environ.get("A100SIM_GRPC_CAPACITY") or 64),
             workers=int(os.environ.get("A100SIM_GRPC_WORKERS") or 32),
+            max_upload_bytes=int(os.environ.get("A100SIM_GRPC_MAX_UPLOAD_BYTES") or cls.max_upload_bytes),
             token=os.environ.get("A100SIM_GRPC_TOKEN") or "",
             enable_workflows=os.environ.get("A100SIM_GRPC_WORKFLOWS", "0") == "1",
             retention_seconds=int(os.environ.get("GRPC_RETENTION_SECONDS", 7 * 86400)),
@@ -73,6 +74,8 @@ class Settings:
             raise ValueError("Gateway capacity must be 1–4096 and workers must be 1–128")
         if self.retained_jobs < self.capacity + self.workers:
             raise ValueError("Retained job limit must cover queued and running work")
+        if self.max_upload_bytes < 1:
+            raise ValueError("Maximum asset upload size must be positive")
         if self.retention_seconds < 1 or self.min_free_bytes < 0:
             raise ValueError("Retention must be positive and minimum free space cannot be negative")
         for value in self.backend_urls.values():
